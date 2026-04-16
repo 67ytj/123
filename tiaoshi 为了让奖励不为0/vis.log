@@ -1,0 +1,58 @@
+nohup: 忽略输入
+Importing module 'gym_38' (/home/aiboy2025/isaacgym/python/isaacgym/_bindings/linux-x86_64/gym_38.so)
+Setting GYM_USD_PLUG_INFO_PATH to /home/aiboy2025/isaacgym/python/isaacgym/_bindings/linux-x86_64/usd/plugInfo.json
+PyTorch version 2.3.0a0+git63d5e92
+Device count 2
+/home/aiboy2025/isaacgym/python/isaacgym/_bindings/src/gymtorch
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Using /home/aiboy2025/.cache/torch_extensions/py38_cu128 as PyTorch extensions root...
+Emitting ninja build file /home/aiboy2025/.cache/torch_extensions/py38_cu128/gymtorch/build.ninja...
+Building extension module gymtorch...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+ninja: no work to do.
+Loading extension module gymtorch...
+/home/aiboy2025/isaacgym/python/isaacgym/torch_utils.py:135: DeprecationWarning: `np.float` is a deprecated alias for the builtin `float`. To silence this warning, use `float` by itself. Doing this will not modify any behavior and is safe. If you specifically wanted the numpy scalar type, use `np.float64` here.
+Deprecated in NumPy 1.20; for more details and guidance: https://numpy.org/devdocs/release/1.20.0-notes.html#deprecations
+  def get_axis_params(value, axis_idx, x_value=0., dtype=np.float, n_dims=3):
+train.py:40: UserWarning: 
+The version_base parameter is not specified.
+Please specify a compatability version level, or None.
+Will assume defaults for version 1.1
+  @hydra.main(config_name='config', config_path='configs')
+[Warning] [carb.gym.plugin] useGpu is set, forcing single scene (0 subscenes)
+Not connected to PVD
++++ Using GPU PhysX
+Physics Engine: PhysX
+Physics Device: cuda:0
+GPU Pipeline: enabled
+/home/aiboy2025/miniconda3/envs/hora/lib/python3.8/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+/home/aiboy2025/cc/tiaoshi/hora/tasks/allegro_hand_hora.py:700: DeprecationWarning: an integer is required (got type isaacgym._bindings.linux-x86_64.gym_38.DofDriveMode).  Implicit conversion to integers using __int__ is deprecated, and may be removed in a future version of Python.
+  hand_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
+/home/aiboy2025/isaacgym/python/isaacgym/torch_utils.py:16: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.clone().detach() or sourceTensor.clone().detach().requires_grad_(True), rather than torch.tensor(sourceTensor).
+  return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
+Error executing job with overrides: ['task=AllegroHandHora', 'headless=False', 'pipeline=gpu', 'task.env.numEnvs=1', 'test=True', 'train.algo=PPO', 'train.ppo.output_name=AllegroHandHora/my_grasp_v1', 'checkpoint=outputs/AllegroHandHora/my_grasp_v1/stage1_nn/best.pth']
+Traceback (most recent call last):
+  File "train.py", line 63, in main
+    agent.restore_test(config.train.load_path)
+  File "/home/aiboy2025/cc/tiaoshi/hora/algo/ppo/ppo.py", line 221, in restore_test
+    checkpoint = torch.load(fn)
+  File "/home/aiboy2025/miniconda3/envs/hora/lib/python3.8/site-packages/torch/serialization.py", line 997, in load
+    with _open_file_like(f, 'rb') as opened_file:
+  File "/home/aiboy2025/miniconda3/envs/hora/lib/python3.8/site-packages/torch/serialization.py", line 444, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/aiboy2025/miniconda3/envs/hora/lib/python3.8/site-packages/torch/serialization.py", line 425, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: '/home/aiboy2025/cc/tiaoshi/outputs/AllegroHandHora/my_grasp_v1/stage1_nn/best.pth'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+Start Building the Environment
+---- Primitive List ----
+['simple_tennis_ball']
+---- Object List ----
+['simple_tennis_ball']
+RunningMeanStd:  (96,)
+RunningMeanStd:  (1,)
