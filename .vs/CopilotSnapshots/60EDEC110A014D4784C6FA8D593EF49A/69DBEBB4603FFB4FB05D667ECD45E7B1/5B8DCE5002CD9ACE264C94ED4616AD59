@@ -1,0 +1,143 @@
+﻿name: ShadowHandHora
+physics_engine: ${..physics_engine}
+on_evaluation: False
+
+env:
+  numEnvs: ${resolve_default:64,${...num_envs}}
+
+  # 3帧历史 * (qpos22 + target22) = 132
+  numObservations: 132
+
+  # 只控制手指，不控制腕
+  numActions: 22
+
+  envSpacing: 0.5
+  episodeLength: 400
+  enableDebugVis: True
+  aggregateMode: 1
+
+  controller:
+    torque_control: True
+    controlFrequencyInv: 6
+    pgain: 3
+    dgain: 0.1               
+
+    # wrist lock (torque mode)
+    wrist_pgain: 50.0
+    wrist_dgain: 1.0
+    wrist_torque_limit: 2.0
+    finger_torque_limit: 0.5
+
+  genGrasps: False
+  clipObservations: 5.0
+  clipActions: 1.0
+  reset_height_threshold: 0.01
+  grasp_cache_name: ''
+
+  forceScale: 0.0
+  randomForceProbScalar: 0.0
+  forceDecay: 0.9
+  forceDecayInterval: 0.08
+
+  hora:
+    propHistoryLen: 30
+    privInfoDim: 9
+
+  # 先保持和 AllegroHandHora 同结构（你说奖励先不改）
+  reward:
+    angvelClipMin: -0.5
+    angvelClipMax: 0.5
+    rotateRewardScale: 1.0
+    objLinvelPenaltyScale: -0.3
+    poseDiffPenaltyScale: -0.3
+    torquePenaltyScale: -0.1
+    workPenaltyScale: -2.0
+
+  baseObjScale: 0.8
+
+  randomization:
+    randomizeMass: True
+    randomizeMassLower: 0.02
+    randomizeMassUpper: 0.25
+    randomizeCOM: True
+    randomizeCOMLower: -0.01
+    randomizeCOMUpper: 0.01
+    randomizeFriction: True
+    randomizeFrictionLower: 0.3
+    randomizeFrictionUpper: 3.0
+    randomizeScale: True
+    randomizeScaleLower: 0.7
+    randomizeScaleUpper: 0.9
+    randomizePDGains: True
+    randomizePGainLower: 0.8
+    randomizePGainUpper: 1.2
+    randomizeDGainLower: 0.8
+    randomizeDGainUpper: 1.2
+    scaleListInit: True
+    randomizeScaleList: [0.7, 0.75, 0.8, 0.85]
+    jointNoiseScale: 0.02
+
+  privInfo:
+    enableObjPos: True
+    enableObjScale: True
+    enableObjMass: True
+    enableObjCOM: True
+    enableObjFriction: True
+
+  object:
+    type: 'simple_tennis_ball'
+    sampleProb: [1.0]
+    # [x, y, z] in env-local coordinates.
+    initPos: [0.0, 0.0, 0.04]
+
+  hand:
+    # Fixed base start pose. Put the hand above the table so it can reach the object without base motion.
+    # [x, y, z] in env-local coordinates.
+    initPos: [0.0, 0.0, 0.19]
+    # Optional: set quaternion [x, y, z, w]. If omitted, code uses default orientation and extraYawDeg.
+    # initRot: [0.0, 0.0, 0.0, 1.0]
+
+    # Extra yaw rotation (degrees) applied on top of default orientation.
+    extraYawDeg: 90.0
+
+    # If True: hand base is fixed (cannot translate). If False: base can be moved by root-state updates.
+    fixBaseLink: False
+
+    # Debug/bootstrapping: move hand kinematically towards object (does NOT change action dim).
+    # Requires fixBaseLink: False
+    kinematicBase: True
+    approachHeight: 0.15
+    approachAlpha: 0.2
+
+    # Align actor root so that the *palm* starts above the object by `approachHeight`.
+    # This compensates the fact that the URDF root is `forearm` (so raw initPos doesn't place palm where you expect).
+    alignToObject: True
+
+  asset:
+    # 注意：这里是相对于 asset_root 的路径（跟 Allegro 写法一致）
+    handAsset: 'assets/shadow_hand_description/shadowhand_with_fingertips.urdf'
+
+  enableCameraSensors: False
+
+  debug:
+    enable: True
+    logOnce: True
+    interval: 1000
+
+sim:
+  dt: 0.0083333
+  substeps: 1
+  up_axis: 'z'
+  use_gpu_pipeline: ${eq:${...pipeline},'gpu'}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:'cuda',${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_offset: 0.002
+    rest_offset: 0.0
+    contact_collection: 2

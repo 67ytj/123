@@ -1,0 +1,15 @@
+#!/bin/bash
+NAME=${1:-run_$(date +%m%d_%H%M)}
+
+export HORA_OUTPUT_NAME=ShadowHandHora/${NAME}
+
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  task=ShadowHandHora train=ShadowHandHora headless=True \
+  train.ppo.output_name=ShadowHandHora/${NAME} \
+  "${@:2}"
+
+echo ""
+echo "============================================"
+echo "保存位置: outputs/ShadowHandHora/${NAME}"
+echo "TensorBoard: tensorboard --logdir outputs/ShadowHandHora/${NAME}/stage1_tb --port 6006"
+echo "============================================"

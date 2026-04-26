@@ -55,6 +55,8 @@ def main(config: DictConfig):
         graphics_device_id=config.graphics_device_id,
         headless=config.headless,
     )
+   
+
 
     output_dif = os.path.join('outputs', config.train.ppo.output_name)
     os.makedirs(output_dif, exist_ok=True)

@@ -1,0 +1,142 @@
+﻿name: ShadowHandHora
+physics_engine: ${..physics_engine}
+on_evaluation: False
+
+env:
+  numEnvs: ${resolve_default:1024,${...num_envs}}
+
+  # 3帧历史 * (qpos22 + target22) = 132
+  numObservations: 132
+
+  # 22 指 + 3 手臂 xyz
+  numActions: 25
+
+  envSpacing: 0.5
+  episodeLength: 200            # ⚠ 改动：原 400，对"下降→抓→抬"足够,训练更快
+  enableDebugVis: True
+  aggregateMode: 1
+
+  controller:
+    torque_control: False
+    controlFrequencyInv: 6
+    pgain: 1.5
+    dgain: 0.2
+
+    # wrist lock (torque mode)
+    wrist_pgain: 50.0
+    wrist_dgain: 1.0
+    wrist_torque_limit: 2.0
+    finger_torque_limit: 0.8
+
+    # 手臂 xyz 动作缩放
+    arm_xyz_action_scale: 0.005
+    arm_xyz_workspace:
+      x: [-0.15, 0.15]
+      y: [-0.10, 0.10]
+      z: [0.03, 0.30]
+
+  genGrasps: False
+  clipObservations: 5.0
+  clipActions: 1.0
+
+  # ⚠ 改动：reset 判据改成"相对掉落",避免 ball 初始微沉就自触发
+  reset_height_threshold: 0.015 # 球心 z < 1.5cm 才算掉地(球半径≈0.026,静止时≈0.026)
+
+  grasp_cache_name: ''
+
+  forceScale: 0.0
+  randomForceProbScalar: 0.0
+  forceDecay: 0.9
+  forceDecayInterval: 0.08
+
+  hora:
+    propHistoryLen: 30
+    privInfoDim: 9
+
+  reward:
+    # All values from DAPG (Rajeswaran 2018) + DexPoint (Qin 2022). Do not hand-tune.
+    reachAlpha: 10.0            # DexPoint: r_reach = 1 - tanh(alpha * d)
+    liftBonusLow: 2.0           # DAPG Relocate stage 1 bonus
+    liftBonusMid: 10.0          # DAPG Relocate stage 2 bonus
+    liftBonusHigh: 20.0         # DAPG Relocate stage 3 bonus
+    liftHeightLow: 0.04         # DAPG 4cm threshold (above rest)
+    liftHeightMid: 0.08         # DAPG 8cm threshold
+    liftHeightHigh: 0.15        # DAPG 15cm threshold
+    actionPenaltyScale: 0.01    # HORA default
+    objectRestHeight: 0.046     # ball radius (0.058) × base scale (0.8)
+
+  baseObjScale: 0.8
+
+  # ⚠ 改动:先全部关掉,等 baseline 能抓起再逐项打开(HORA 的 priv_info 需要真值 DR)
+  randomization:
+    randomizeMass: False
+    randomizeMassLower: 0.04         # ⚠ 改动:网球真实质量 ≈0.058,原 0.02 偏离太大
+    randomizeMassUpper: 0.08         # ⚠ 改动:0.25→0.08
+    randomizeCOM: False
+    randomizeCOMLower: -0.005        # ⚠ 改动:球半径 2.6cm,±1cm 偏心过大
+    randomizeCOMUpper: 0.005
+    randomizeFriction: False
+    randomizeFrictionLower: 0.5      # ⚠ 改动:0.3→0.5, 0.3 太滑基本抓不住
+    randomizeFrictionUpper: 2.0      # ⚠ 改动:3.0→2.0
+    randomizeScale: False
+    # ⚠ 改动:scaleList 和 Lower/Upper 二选一,这里统一用 list
+    scaleListInit: True
+    randomizeScaleList: [0.7, 0.75, 0.8, 0.85]
+    # randomizeScaleLower / Upper 删掉,避免和 list 冲突
+    randomizePDGains: False
+    randomizePGainLower: 0.8
+    randomizePGainUpper: 1.2
+    randomizeDGainLower: 0.8
+    randomizeDGainUpper: 1.2
+    jointNoiseScale: 0.0             # ⚠ 改动:0.02→0, baseline 阶段先干净训练
+
+  privInfo:
+    enableObjPos: True
+    enableObjScale: True
+    enableObjMass: True
+    enableObjCOM: True
+    enableObjFriction: True
+
+  object:
+    type: simple_tennis_ball
+    initPos: [0.0, 0.0, 0.03]
+
+  hand:
+    fixBaseLink: False
+    kinematicBase: False
+    policyControlsArm: True
+    alignToObject: True
+    initRot: [0.5, 0.5, 0.5, 0.5]
+    initPos: [-0.10, 0.0, 0.10]
+    approachHeight: 0.04
+    extraYawDeg: 0.0
+    fixInertia: False
+
+  asset:
+    # 注意:这里是相对于 asset_root 的路径(跟 Allegro 写法一致)
+    handAsset: 'assets/shadow_hand_description/shadowhand_with_fingertips.urdf'
+
+  enableCameraSensors: False
+
+  debug:
+    enable: True
+    logOnce: True
+    interval: 1000
+
+sim:
+  dt: 0.0083333                 # 1/120
+  substeps: 1
+  up_axis: 'z'
+  use_gpu_pipeline: ${eq:${...pipeline},'gpu'}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:'cuda',${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_offset: 0.002
+    rest_offset: 0.0
+    contact_collection: 2

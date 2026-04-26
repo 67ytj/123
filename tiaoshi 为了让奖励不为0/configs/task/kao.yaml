@@ -1,0 +1,104 @@
+﻿name: AllegroHandHora
+physics_engine: ${..physics_engine}
+on_evaluation: False
+
+env:
+  numEnvs: ${resolve_default:1024,${...num_envs}}
+  numObservations: 102  96 (3×32 joint lag history) + 6 (palm_pos + ball_rel_pos)
+  
+  【已修正】从 16 改为 19。这多出来的 3 个维度将作为基座在 X, Y, Z 方向上的目标平移速度 (而非推力)。
+  numActions: 19 
+  envSpacing: 0.5 
+  episodeLength: 400
+  enableDebugVis: True
+  aggregateMode: 1
+
+  controller:
+    torque_control: True 
+    controlFrequencyInv: 6
+    pgain: 3
+    dgain: 0.1
+
+  genGrasps: False
+  clipObservations: 5.0
+  clipActions: 1.0
+  
+  球在桌面上初始高度约 0.04m，掉落低于 0.01m 视为掉落重置
+  reset_height_threshold: 0.01
+  关键修复：如果不使用缓存的预抓取姿态，保持为空字符串
+  grasp_cache_name: '' 
+
+  forceScale: 0.0
+  randomForceProbScalar: 0.0
+  forceDecay: 0.9
+  forceDecayInterval: 0.08
+
+  hora:
+    propHistoryLen: 30
+    privInfoDim: 9
+
+  【已修正】注释与 compute_hand_reward JIT 函数中的真实逻辑对齐:
+  approach_rew: hand_dist < 0.3
+  is_touching: >= 2 指距离球 < 0.07m
+  is_grasping: >= 3 指距离球 < 0.07m
+  lift_z: object_init_z + 0.02m (阶梯奖励)
+  reward: {}
+
+  baseObjScale: 1.0
+  
+  randomization:
+    randomizeMass: False
+    randomizeMassLower: 0.02
+    randomizeMassUpper: 0.25
+    randomizeCOM: True
+    randomizeCOMLower: -0.01
+    randomizeCOMUpper: 0.01
+    randomizeFriction: True
+    randomizeFrictionLower: 1.5
+    randomizeFrictionUpper: 3.0
+    randomizeScale: False
+    修复 KeyError: 补全缺失参数
+    randomizeScaleLower: 0.7
+    randomizeScaleUpper: 0.9
+    randomizePDGains: True
+    randomizePGainLower: 0.8
+    randomizePGainUpper: 1.2
+    randomizeDGainLower: 0.8
+    randomizeDGainUpper: 1.2
+    scaleListInit: False
+    randomizeScaleList: [0.7, 0.75, 0.8, 0.85]
+    jointNoiseScale: 0.02
+
+  privInfo:
+    enableObjPos: True
+    enableObjScale: True
+    enableObjMass: True
+    enableObjCOM: True
+    enableObjFriction: True
+
+  object:
+    type: 'simple_tennis_ball' 
+    sampleProb: [1.0]
+
+  asset:
+    handAsset: 'assets/allegro/allegro_internal.urdf'
+
+  enableCameraSensors: False
+
+sim:
+  dt: 0.0083333
+  substeps: 1
+  up_axis: 'z'
+  use_gpu_pipeline: ${eq:${...pipeline},'gpu'}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:'cuda',${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 2  ⚠️ 优化：由 1 提升至 2，减少指尖抓取时的穿模抖动
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_offset: 0.002
+    rest_offset: 0.0
+    contact_collection: 2

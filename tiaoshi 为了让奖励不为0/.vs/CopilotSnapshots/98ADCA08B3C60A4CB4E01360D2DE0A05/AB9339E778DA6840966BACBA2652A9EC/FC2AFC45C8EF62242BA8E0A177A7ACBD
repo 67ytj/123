@@ -1,0 +1,44 @@
+﻿seed: ${..seed}
+algo: PPO
+network:
+  mlp:
+    units: [512, 256, 128]
+  priv_mlp:
+    units: [256, 128, 8]
+
+load_path: ${..checkpoint}
+
+ppo:
+  output_name: 'shadow_debug'
+  normalize_input: True
+  normalize_value: True
+  value_bootstrap: True
+  num_actors: ${...task.env.numEnvs}
+  normalize_advantage: True
+  gamma: 0.99
+  tau: 0.95
+
+  learning_rate: 5e-4            # ⚠ 改动: 5e-3 → 5e-4 (原值会炸)
+  kl_threshold: 0.02             # 保留自适应 lr, 作为第二道保险
+
+  horizon_length: 16             # ⚠ 改动: 8 → 16 (batch = 64 × 16 = 1024)
+  minibatch_size: 256            # 4 份/epoch, 配合 mini_epochs=5 共 20 grad steps/update
+  mini_epochs: 5
+
+  clip_value: True
+  critic_coef: 4
+  entropy_coef: 0.005            # ⚠ 改动: 0.0 → 0.005 (baseline 阶段加一点探索)
+  e_clip: 0.2
+  bounds_loss_coef: 0.0001
+  truncate_grads: True
+  grad_norm: 1.0
+
+  save_best_after: 200           # ⚠ 改动: 0 → 200 (避免保存早期噪声模型)
+  save_frequency: 500
+  max_agent_steps: 50000000      # ⚠ 改动: 1.5e9 → 5e7 (debug 用不到那么多)
+
+  # ⚠ 改动: DR 全关时 priv_info 是常量,先关掉整个通路
+  priv_info: False
+  priv_info_dim: 3               # 保留字段但设成 3, 代码里只填 obj_pos
+  priv_info_embed_dim: 8
+  proprio_adapt: False
