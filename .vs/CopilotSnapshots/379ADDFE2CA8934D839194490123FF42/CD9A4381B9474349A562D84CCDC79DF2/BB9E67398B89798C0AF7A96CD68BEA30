@@ -1,0 +1,203 @@
+﻿import sys
+
+# ============ PATCH 1: yaml reward block ============
+yaml_path = 'configs/task/ShadowHandHora.yaml'
+with open(yaml_path) as f:
+    lines = f.readlines()
+
+new_yaml = """  reward:
+    # === R1 reward (sphere grasp, sim-derived only, gated 4-stage) ===
+    reachSigma:          0.10
+    graspSigma:          0.03
+    contactForceThresh:  0.5
+    contactForceScale:   3.0
+    contactTargetCount:  3.0
+    liftLow:             0.02
+    liftHigh:            0.07
+    successDz:           0.05
+    successForce:        1.0
+    weights:
+      reach:    0.5
+      grasp:    1.0
+      contact:  1.0
+      lift:     3.0
+      success:  10.0
+    objectRestHeight:    0.046
+""".splitlines(keepends=True)
+
+s = None
+for i, ln in enumerate(lines):
+    if ln.rstrip() == '  reward:':
+        s = i; break
+assert s is not None, 'yaml reward: not found'
+e = s + 1
+while e < len(lines):
+    ln = lines[e]
+    if ln.strip() == '':
+        e += 1; continue
+    indent = len(ln) - len(ln.lstrip(' '))
+    if indent <= 2:
+        break
+    e += 1
+with open(yaml_path, 'w') as f:
+    f.writelines(lines[:s] + new_yaml + lines[e:])
+print(f'[YAML] reward block replaced (lines {s+1}-{e})')
+
+# ============ PATCH 2 + 3: code ============
+code_path = 'hora/tasks/shadow_hand_hora.py'
+with open(code_path) as f:
+    code = f.readlines()
+
+# --- PATCH 2: _setup_reward_config ---
+new_setup = '''    def _setup_reward_config(self, r_config):
+        r_config = r_config or {}
+        # ===== R1 reward parameters (sphere grasp, sim-derived) =====
+        self.r1_reach_sigma          = float(r_config.get('reachSigma', 0.10))
+        self.r1_grasp_sigma          = float(r_config.get('graspSigma', 0.03))
+        self.r1_contact_force_thresh = float(r_config.get('contactForceThresh', 0.5))
+        self.r1_contact_force_scale  = float(r_config.get('contactForceScale', 3.0))
+        self.r1_contact_target_count = float(r_config.get('contactTargetCount', 3.0))
+        self.r1_lift_low             = float(r_config.get('liftLow', 0.02))
+        self.r1_lift_high            = float(r_config.get('liftHigh', 0.07))
+        self.r1_success_dz           = float(r_config.get('successDz', 0.05))
+        self.r1_success_force        = float(r_config.get('successForce', 1.0))
+        weights = r_config.get('weights', {}) or {}
+        self.r1_w_reach    = float(weights.get('reach',   0.5))
+        self.r1_w_grasp    = float(weights.get('grasp',   1.0))
+        self.r1_w_contact  = float(weights.get('contact', 1.0))
+        self.r1_w_lift     = float(weights.get('lift',    3.0))
+        self.r1_w_success  = float(weights.get('success', 10.0))
+        self.object_rest_height = float(r_config.get('objectRestHeight', 0.046))
+
+'''.splitlines(keepends=True)
+
+s2 = None
+for i, ln in enumerate(code):
+    if ln.startswith('    def _setup_reward_config('):
+        s2 = i; break
+assert s2 is not None, '_setup_reward_config not found'
+e2 = s2 + 1
+while e2 < len(code):
+    if code[e2].startswith('    def '):
+        break
+    e2 += 1
+code = code[:s2] + new_setup + code[e2:]
+print(f'[CODE] _setup_reward_config replaced (orig lines {s2+1}-{e2})')
+
+# --- PATCH 3: reward block in post_physics_step ---
+new_rew = '''        with torch.no_grad():
+            # === Sim-derived quantities (all from IsaacGym tensors) ===
+            finger_pos = self.rigid_body_states[:, self.fingertip_body_indices, 0:3]
+            palm_pos   = self.rigid_body_states[:, self.palm_body_index, 0:3]
+            obj_pos    = self.object_pos
+            tip_forces = self.contact_forces[:, self.fingertip_body_indices, :]
+
+            # === Distances ===
+            d_palm = torch.norm(palm_pos - obj_pos, dim=-1)
+            d_tip  = torch.norm(finger_pos - obj_pos.unsqueeze(1), dim=-1).mean(dim=-1)
+
+            # === Contact ===
+            tip_force_mag = torch.norm(tip_forces, dim=-1)
+            F_total       = tip_force_mag.sum(dim=-1)
+            n_contact     = (tip_force_mag > self.r1_contact_force_thresh).float().sum(dim=-1)
+
+            # === Lift ===
+            delta_z = (obj_pos[:, 2] - self.object_init_z).clamp(min=0.0)
+
+            # === Stage 1: Reach ===
+            r_reach = torch.exp(-d_palm / self.r1_reach_sigma)
+
+            # === Stage 2: Grasp (gated by reach) ===
+            r_grasp = r_reach * torch.exp(-d_tip / self.r1_grasp_sigma)
+
+            # === Stage 3: Contact (gated by grasp) ===
+            r_contact_force = torch.tanh(F_total / self.r1_contact_force_scale)
+            r_contact_count = (n_contact / self.r1_contact_target_count).clamp(0.0, 1.0)
+            r_contact = r_grasp * 0.5 * (r_contact_force + r_contact_count)
+
+            # === Stage 4: Lift (gated by contact) ===
+            r_lift_low  = (delta_z / self.r1_lift_low).clamp(0.0, 1.0)
+            denom_h     = max(self.r1_lift_high - self.r1_lift_low, 1e-6)
+            r_lift_high = ((delta_z - self.r1_lift_low) / denom_h).clamp(0.0, 1.0)
+            r_lift = r_contact * (0.3 * r_lift_low + 0.7 * r_lift_high)
+
+            # === Success ===
+            success_mask = (
+                (delta_z > self.r1_success_dz)
+                & (n_contact >= 2)
+                & (F_total > self.r1_success_force)
+            )
+            r_success = success_mask.float()
+
+            # === Regularization ===
+            act = self._debug_last_actions
+            if act is not None:
+                r_act = -0.0005 * (act ** 2).sum(dim=-1)
+            else:
+                r_act = torch.zeros(self.num_envs, device=self.device)
+            r_dofvel = -0.0001 * (self.hand_dof_vel ** 2).sum(dim=-1)
+
+            # === Total ===
+            reward = (
+                self.r1_w_reach    * r_reach
+                + self.r1_w_grasp    * r_grasp
+                + self.r1_w_contact  * r_contact
+                + self.r1_w_lift     * r_lift
+                + self.r1_w_success  * r_success
+                + r_act
+                + r_dofvel
+            )
+            self.rew_buf[:] = reward
+
+            self.extras['r_reach']       = r_reach.mean()
+            self.extras['r_grasp']       = r_grasp.mean()
+            self.extras['r_contact']     = r_contact.mean()
+            self.extras['r_lift']        = r_lift.mean()
+            self.extras['r_success']     = r_success.mean()
+            self.extras['success']       = r_success.mean()
+            self.extras['rewards/total'] = reward.mean()
+
+            self.rew_log_counter += 1
+            if self.rew_log_counter % 50 == 0:
+                step = self.rew_log_counter * self.num_envs
+                self.rew_writer.add_scalar('rewards/reach',   r_reach.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/grasp',   r_grasp.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/contact', r_contact.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/lift',    r_lift.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/success', r_success.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/act',     r_act.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/dofvel',  r_dofvel.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/total',   reward.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/d_palm',    d_palm.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/d_tip',     d_tip.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/delta_z',   delta_z.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/F_total',   F_total.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/n_contact', n_contact.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/success',   r_success.mean().item(), step)
+
+'''.splitlines(keepends=True)
+
+pp = None
+for i, ln in enumerate(code):
+    if ln.startswith('    def post_physics_step(self):'):
+        pp = i; break
+assert pp is not None, 'post_physics_step not found'
+
+s3 = None
+for i in range(pp, len(code)):
+    if code[i].rstrip() == '        with torch.no_grad():':
+        s3 = i; break
+assert s3 is not None, 'with torch.no_grad(): not found in post_physics_step'
+
+e3 = None
+for i in range(s3, len(code)):
+    if "diagnostics/lift_z" in code[i]:
+        e3 = i + 1; break
+assert e3 is not None, 'diagnostics/lift_z anchor not found'
+
+code = code[:s3] + new_rew + code[e3:]
+print(f'[CODE] reward block replaced (orig lines {s3+1}-{e3})')
+
+with open(code_path, 'w') as f:
+    f.writelines(code)
+print('[OK] all 3 patches applied')

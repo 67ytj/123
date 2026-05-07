@@ -8,7 +8,47 @@ from isaacgym import gymtorch
 from isaacgym import gymapi
 from isaacgym.torch_utils import to_torch, unscale, tensor_clamp, torch_rand_float
 
+from hora.utils.dfcdata import DFCDataPool
+
 from .base.vec_task import VecTask
+
+
+ACTUATOR_NAMES_18 = [
+    'robot0:FFJ3', 'robot0:FFJ2', 'robot0:FFJ1',
+    'robot0:MFJ3', 'robot0:MFJ2', 'robot0:MFJ1',
+    'robot0:RFJ3', 'robot0:RFJ2', 'robot0:RFJ1',
+    'robot0:LFJ4', 'robot0:LFJ3', 'robot0:LFJ2', 'robot0:LFJ1',
+    'robot0:THJ4', 'robot0:THJ3', 'robot0:THJ2', 'robot0:THJ1', 'robot0:THJ0',
+]
+
+FINGER_DOF_NAMES_22 = [
+    'robot0:FFJ3', 'robot0:FFJ2', 'robot0:FFJ1', 'robot0:FFJ0',
+    'robot0:MFJ3', 'robot0:MFJ2', 'robot0:MFJ1', 'robot0:MFJ0',
+    'robot0:RFJ3', 'robot0:RFJ2', 'robot0:RFJ1', 'robot0:RFJ0',
+    'robot0:LFJ4', 'robot0:LFJ3', 'robot0:LFJ2', 'robot0:LFJ1', 'robot0:LFJ0',
+    'robot0:THJ4', 'robot0:THJ3', 'robot0:THJ2', 'robot0:THJ1', 'robot0:THJ0',
+]
+
+J1_TO_J0_PAIRS = [
+    ('robot0:FFJ1', 'robot0:FFJ0'),
+    ('robot0:MFJ1', 'robot0:MFJ0'),
+    ('robot0:RFJ1', 'robot0:RFJ0'),
+    ('robot0:LFJ1', 'robot0:LFJ0'),
+]
+
+PALM_BODY = 'robot0:palm'
+FINGERTIP_BODIES = ['robot0:ffdistal', 'robot0:mfdistal', 'robot0:rfdistal', 'robot0:lfdistal', 'robot0:thdistal']
+
+
+def euler_xy_to_quat(eul_xy):
+    rx, ry = eul_xy[..., 0], eul_xy[..., 1]
+    cx, sx = torch.cos(rx * 0.5), torch.sin(rx * 0.5)
+    cy, sy = torch.cos(ry * 0.5), torch.sin(ry * 0.5)
+    qw = cx * cy
+    qx = sx * cy
+    qy = cx * sy
+    qz = -sx * sy
+    return torch.stack([qx, qy, qz, qw], dim=-1)
 
 
 class ShadowHandHora(VecTask):
@@ -152,8 +192,6 @@ class ShadowHandHora(VecTask):
 
         self.prev_targets[:, :self.num_hand_dofs] = self.hand_dof_pos.clone()
         self.cur_targets[:, :self.num_hand_dofs] = self.hand_dof_pos.clone()
-        self.prev_targets[:, self.wrist_dof_indices] = 0.0
-        self.cur_targets[:, self.wrist_dof_indices] = 0.0
 
         # cache of initial hand root state (filled in _create_envs)
         if not hasattr(self, 'hand_init_state'):
@@ -167,6 +205,29 @@ class ShadowHandHora(VecTask):
         self.rew_writer = SummaryWriter(log_dir=rew_log_dir)
         self.rew_log_counter = 0
         print(f'[ShadowHandHora] Reward components TB → {rew_log_dir}')
+
+        self.object_init_z = torch.full(
+            (self.num_envs,),
+            float(self.config['env']['object']['initPos'][2]),
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        dfc_cfg = (self.config.get('env', {}) or {}).get('dfcdata', {}) or {}
+        if dfc_cfg.get('enable', False):
+            self.dfc_pool = DFCDataPool(
+                source_path=dfc_cfg['sourcePath'],
+                target_scale=dfc_cfg.get('targetScale', 0.08),
+            )
+            candidates = self.dfc_pool.find_objects(dfc_cfg.get('objectKeywords', []))
+            assert candidates, f"no DFCData object matches {dfc_cfg.get('objectKeywords', [])}"
+            self.current_object_code = candidates[0]
+            print(f'[HORA] DFCData object: {self.current_object_code} ({len(candidates)} candidates)')
+            self.q_star_22 = torch.zeros(self.num_envs, 22, device=self.device)
+        else:
+            self.dfc_pool = None
+            self.current_object_code = None
+            self.q_star_22 = torch.zeros(self.num_envs, 22, device=self.device)
 
     def _allocate_task_buffer(self, num_envs):
         self.num_env_factors = self.config['env']['hora']['privInfoDim']
@@ -283,64 +344,43 @@ class ShadowHandHora(VecTask):
         print('[ShadowHandHora] Body names:', body_names)
 
         dof_name_to_idx = {name: i for i, name in enumerate(dof_names)}
-        for name in ('WRJ1', 'WRJ2'):
-            if name not in dof_name_to_idx:
-                raise RuntimeError(f'[ShadowHandHora] Missing wrist DOF {name}. Available: {dof_names}')
-
-        self.wrist_dof_indices = to_torch(
-            [dof_name_to_idx['WRJ2'], dof_name_to_idx['WRJ1']],
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        controlled = [i for i, name in enumerate(dof_names) if name not in ('WRJ1', 'WRJ2')]
-        if len(controlled) != 22:
-            raise RuntimeError(f'[ShadowHandHora] Expected 22 non-wrist DOFs, got {len(controlled)}. Available: {dof_names}')
-        self.controlled_dof_indices = to_torch(controlled, dtype=torch.long, device=self.device)
-
-        # Bend-only joints for pre-grasp bias (exclude spread/roll/thumb-opposition DOFs).
-        _bend_names = set()
-        for prefix in ('FF', 'MF', 'RF', 'LF'):
-            _bend_names.update([f'{prefix}J1', f'{prefix}J2', f'{prefix}J3'])
-        _bend_names.update(['THJ1', 'THJ2'])   # thumb flexion DOFs only
-        self.bend_dof_indices = to_torch(
-            [i for i, name in enumerate(dof_names) if name in _bend_names],
-            dtype=torch.long, device=self.device,
-        )
-        print(f'[ShadowHandHora] bend DOFs ({len(self.bend_dof_indices)}):',
-              [dof_names[int(i)] for i in self.bend_dof_indices])
-
         body_name_to_idx = {name: i for i, name in enumerate(body_names)}
 
-        if 'palm' not in body_name_to_idx:
-            raise RuntimeError(f"[ShadowHandHora] Missing 'palm' rigid body. Available: {body_names}")
-        self.palm_body_index = int(body_name_to_idx['palm'])
+        def _name2dof(env_ptr, hand_handle, name):
+            return self.gym.find_actor_dof_index(env_ptr, hand_handle, name, gymapi.DOMAIN_ACTOR)
 
-        tip_names = ['fftip', 'mftip', 'rftip', 'lftip', 'thtip']
-        missing_tip = [name for name in tip_names if name not in body_name_to_idx]
+        def _name2body(env_ptr, hand_handle, name):
+            return self.gym.find_actor_rigid_body_index(env_ptr, hand_handle, name, gymapi.DOMAIN_ENV)
 
-        if missing_tip:
-            distal_names = ['ffdistal', 'mfdistal', 'rfdistal', 'lfdistal', 'thdistal']
-            missing_distal = [name for name in distal_names if name not in body_name_to_idx]
-            if missing_distal:
-                raise RuntimeError(
-                    f'[ShadowHandHora] Missing tip bodies {missing_tip} and distal fallback {missing_distal}. Available: {body_names}'
-                )
-            print('[ShadowHandHora] Tip links not found, fallback to distal links:', distal_names)
-            resolved_tip_names = distal_names
-            self.fingertip_body_indices = to_torch(
-                [body_name_to_idx[name] for name in distal_names], dtype=torch.long, device=self.device
-            )
-        else:
-            resolved_tip_names = tip_names
-            self.fingertip_body_indices = to_torch(
-                [body_name_to_idx[name] for name in tip_names], dtype=torch.long, device=self.device
-            )
-
-        print(
-            '[ShadowHandHora] Fingertip bodies:',
-            list(zip(resolved_tip_names, self.fingertip_body_indices.detach().cpu().tolist())),
+        self.actuator_dof_indices_18 = torch.tensor(
+            [_name2dof(env0, hand0, n) for n in ACTUATOR_NAMES_18], dtype=torch.long, device=self.device
         )
+        self.finger_dof_indices_22 = torch.tensor(
+            [_name2dof(env0, hand0, n) for n in FINGER_DOF_NAMES_22], dtype=torch.long, device=self.device
+        )
+        self.j1_indices = torch.tensor(
+            [_name2dof(env0, hand0, p[0]) for p in J1_TO_J0_PAIRS], dtype=torch.long, device=self.device
+        )
+        self.j0_indices = torch.tensor(
+            [_name2dof(env0, hand0, p[1]) for p in J1_TO_J0_PAIRS], dtype=torch.long, device=self.device
+        )
+
+        if (self.actuator_dof_indices_18 < 0).any() or (self.finger_dof_indices_22 < 0).any():
+            raise RuntimeError('[ShadowHandHora] finger DOF / actuator name not found in MJCF')
+
+        self.controlled_dof_indices = self.finger_dof_indices_22
+
+        if PALM_BODY not in body_name_to_idx:
+            raise RuntimeError(f"[ShadowHandHora] Missing '{PALM_BODY}' rigid body. Available: {body_names}")
+        self.palm_body_index = _name2body(env0, hand0, PALM_BODY)
+        self.fingertip_body_indices = torch.tensor(
+            [_name2body(env0, hand0, b) for b in FINGERTIP_BODIES], dtype=torch.long, device=self.device
+        )
+        if (self.fingertip_body_indices < 0).any():
+            raise RuntimeError('[ShadowHandHora] fingertip body name not found in MJCF')
+
+        print('[ShadowHandHora] MJCF indices ok: 18 actuator + 22 finger DOF + 4 mirrored J0 + wrist via root')
+        print('[ShadowHandHora] Fingertip bodies:', list(zip(FINGERTIP_BODIES, self.fingertip_body_indices.detach().cpu().tolist())))
 
     def _acquire_tensors(self):
         actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
@@ -362,103 +402,129 @@ class ShadowHandHora(VecTask):
         if env_ids.numel() == 0:
             return
 
-        self.root_state_tensor[self.object_indices[env_ids]] = self.object_init_state[env_ids].clone()
-        self.root_state_tensor[self.object_indices[env_ids], 7:13] = 0.0
+        env_ids_long = env_ids.long() if env_ids.dtype != torch.long else env_ids
 
-        if not self.hand_fix_base_link and self.hand_init_state is not None:
-            hand_actor_ids = self.hand_indices[env_ids]
-            self.root_state_tensor[hand_actor_ids] = self.hand_init_state[env_ids].clone()
-            self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids]
+        # Always reset the object root first.
+        object_actor_ids = self.object_indices[env_ids_long]
+        self.root_state_tensor[object_actor_ids] = self.object_init_state[env_ids_long].clone()
+        self.root_state_tensor[object_actor_ids, 7:13] = 0.0
+        self.object_init_z[env_ids_long] = self.root_state_tensor[object_actor_ids, 2]
+
+        if self.dfc_pool is not None:
+            g = self.dfc_pool.sample(self.current_object_code, len(env_ids_long), device=self.device)
+
+            obj_pos = self.root_state_tensor[object_actor_ids, 0:3].clone()
+            obj_pos[:, 2] = g['obj_z']
+            obj_quat = euler_xy_to_quat(g['obj_eul'])
+            self.root_state_tensor[object_actor_ids, 0:3] = obj_pos
+            self.root_state_tensor[object_actor_ids, 3:7] = obj_quat
+            self.root_state_tensor[object_actor_ids, 7:13] = 0.0
+            self.object_init_z[env_ids_long] = obj_pos[:, 2]
+
+            hand_actor_ids = self.hand_indices[env_ids_long]
+            self.root_state_tensor[hand_actor_ids, 0:3] = g['pos']
+            self.root_state_tensor[hand_actor_ids, 3:7] = g['rot']
             self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
 
-            # Write back + refresh before align so palm position is up-to-date.
-            ids_i32 = hand_actor_ids.to(torch.int32)
-            self.gym.set_actor_root_state_tensor_indexed(
-                self.sim,
-                gymtorch.unwrap_tensor(self.root_state_tensor),
-                gymtorch.unwrap_tensor(ids_i32),
-                len(ids_i32),
+            dof_view = self.dof_state.view(self.num_envs, -1, 2)
+            dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 0] = g['q']
+            dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 1] = 0.0
+
+            self.cur_targets[env_ids_long] = 0.0
+            self.prev_targets[env_ids_long] = 0.0
+            self.cur_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+            self.prev_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+
+            self.hand_dof_vel[env_ids_long, :] = 0.0
+            self.hand_dof_pos[env_ids_long, :] = 0.0
+            self.hand_dof_pos[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+
+            self.q_star_22[env_ids_long] = g['q']
+        else:
+            if not self.hand_fix_base_link and self.hand_init_state is not None:
+                hand_actor_ids = self.hand_indices[env_ids_long]
+                self.root_state_tensor[hand_actor_ids] = self.hand_init_state[env_ids_long].clone()
+                self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
+                self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
+
+                ids_i32 = hand_actor_ids.to(torch.int32)
+                self.gym.set_actor_root_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.root_state_tensor),
+                    gymtorch.unwrap_tensor(ids_i32),
+                    len(ids_i32),
+                )
+                self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+            if self.hand_align_to_object:
+                self._align_hand_root_to_object(env_ids=env_ids_long)
+
+                hand_actor_ids = self.hand_indices[env_ids_long]
+                self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
+
+                hand_actor_ids_i32 = hand_actor_ids.to(torch.int32)
+                self.gym.set_actor_root_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.root_state_tensor),
+                    gymtorch.unwrap_tensor(hand_actor_ids_i32),
+                    len(env_ids_long),
+                )
+
+            self.hand_dof_pos[env_ids_long, :] = 0.0
+            self.hand_dof_vel[env_ids_long, :] = 0.0
+
+            noise = torch_rand_float(-0.05, 0.05, (len(env_ids_long), self.actuator_dof_indices_18.numel()), device=self.device) + 0.35
+            noise = tensor_clamp(
+                noise,
+                self.hand_dof_lower_limits[self.actuator_dof_indices_18],
+                self.hand_dof_upper_limits[self.actuator_dof_indices_18],
             )
-            self.gym.refresh_rigid_body_state_tensor(self.sim)
+            self.hand_dof_pos[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+            self.cur_targets[env_ids_long] = 0.0
+            self.prev_targets[env_ids_long] = 0.0
+            self.cur_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+            self.prev_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
 
-        if self.hand_align_to_object:
-            self._align_hand_root_to_object(env_ids=env_ids)
+        if self.dfc_pool is None:
+            self.cur_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.cur_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+            self.prev_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.prev_targets[env_ids_long[:, None], self.j1_indices[None, :]]
 
-            # Keep orientation locked after align.
-            hand_actor_ids = self.hand_indices[env_ids]
-            self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids]
-
-            # Align updated root_state_tensor; write back.
-            hand_actor_ids = self.hand_indices[env_ids].to(torch.int32)
-            self.gym.set_actor_root_state_tensor_indexed(
-                self.sim,
-                gymtorch.unwrap_tensor(self.root_state_tensor),
-                gymtorch.unwrap_tensor(hand_actor_ids),
-                len(env_ids),
-            )
-
-        self.hand_dof_pos[env_ids, :] = 0.0
-        self.hand_dof_vel[env_ids, :] = 0.0
-
-        # Pre-grasp: 只对"弯曲"关节加 ~20° 偏置；张开/拇指对掌等保持 0。
-        bend = self.bend_dof_indices
-        bias = 0.35
-        noise = torch_rand_float(-0.05, 0.05, (len(env_ids), bend.numel()), device=self.device) + bias
-        noise = tensor_clamp(
-            noise,
-            self.hand_dof_lower_limits[bend],
-            self.hand_dof_upper_limits[bend],
-        )
-        env_hand_pos = self.hand_dof_pos[env_ids].clone()
-        env_hand_pos[:, bend] = noise
-        env_hand_pos[:, self.wrist_dof_indices] = 0.0
-        self.hand_dof_pos[env_ids] = env_hand_pos
-        self.hand_dof_vel[env_ids, :] = 0.0
-
-        self.prev_targets[env_ids, :self.num_hand_dofs] = self.hand_dof_pos[env_ids, :self.num_hand_dofs]
-        self.cur_targets[env_ids, :self.num_hand_dofs] = self.hand_dof_pos[env_ids, :self.num_hand_dofs]
-        env_prev_targets = self.prev_targets[env_ids].clone()
-        env_cur_targets = self.cur_targets[env_ids].clone()
-        env_prev_targets[:, self.wrist_dof_indices] = 0.0
-        env_cur_targets[:, self.wrist_dof_indices] = 0.0
-        self.prev_targets[env_ids] = env_prev_targets
-        self.cur_targets[env_ids] = env_cur_targets
-
-        object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
+        combined_actor_ids = torch.cat([
+            self.hand_indices[env_ids_long],
+            torch.unique(self.object_indices[env_ids_long]),
+        ]).to(torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.root_state_tensor),
-            gymtorch.unwrap_tensor(object_indices),
-            len(object_indices),
+            gymtorch.unwrap_tensor(combined_actor_ids),
+            len(combined_actor_ids),
         )
 
-        # Hand root state has already been pushed above when needed (movable base init / align).
-
-        hand_indices = self.hand_indices[env_ids].to(torch.int32)
+        hand_ids_i32 = self.hand_indices[env_ids_long].to(torch.int32)
         self.gym.set_dof_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(hand_indices),
-            len(env_ids),
+            gymtorch.unwrap_tensor(hand_ids_i32),
+            len(env_ids_long),
         )
 
         if not self.torque_control:
             self.gym.set_dof_position_target_tensor_indexed(
                 self.sim,
                 gymtorch.unwrap_tensor(self.cur_targets),
-                gymtorch.unwrap_tensor(hand_indices),
-                len(env_ids),
+                gymtorch.unwrap_tensor(hand_ids_i32),
+                len(env_ids_long),
             )
 
-        self.obs_hist[env_ids] = 0.0
-        self.proprio_hist_buf[env_ids] = 0.0
-        self.progress_buf[env_ids] = 0
-        self.at_reset_buf[env_ids] = 1
+        self.obs_hist[env_ids_long] = 0.0
+        self.proprio_hist_buf[env_ids_long] = 0.0
+        self.progress_buf[env_ids_long] = 0
+        self.at_reset_buf[env_ids_long] = 1
 
     def pre_physics_step(self, actions):
         if actions is None:
             return
-        expected_dim = 25 if self.policy_controls_arm else 22
+        expected_dim = 21 if self.policy_controls_arm else 18
         if actions.shape[1] != expected_dim:
             raise RuntimeError(f'[ShadowHandHora] Expected actions dim={expected_dim}, got {actions.shape}')
 
@@ -466,11 +532,11 @@ class ShadowHandHora(VecTask):
         self._debug_last_actions = actions
 
         if self.policy_controls_arm:
-            arm_action = actions[:, :3]
-            finger_action = actions[:, 3:]
+            finger_action = actions[:, :18]
+            arm_action = actions[:, 18:21]
         else:
-            arm_action = None
             finger_action = actions
+            arm_action = None
 
         # ---- Arm xyz: integrate root state + workspace clamp ----
         if self.policy_controls_arm:
@@ -510,13 +576,13 @@ class ShadowHandHora(VecTask):
         finger_action = torch.clamp(finger_action, -1.0, 1.0)
         targets = self.prev_targets.clone()
 
-        targets[:, self.controlled_dof_indices] = targets[:, self.controlled_dof_indices] + (1.0 / 48.0) * finger_action
-        targets[:, self.controlled_dof_indices] = tensor_clamp(
-            targets[:, self.controlled_dof_indices],
-            self.hand_dof_lower_limits[self.controlled_dof_indices],
-            self.hand_dof_upper_limits[self.controlled_dof_indices],
+        targets[:, self.actuator_dof_indices_18] = targets[:, self.actuator_dof_indices_18] + (1.0 / 48.0) * finger_action
+        targets[:, self.actuator_dof_indices_18] = tensor_clamp(
+            targets[:, self.actuator_dof_indices_18],
+            self.hand_dof_lower_limits[self.actuator_dof_indices_18],
+            self.hand_dof_upper_limits[self.actuator_dof_indices_18],
         )
-        targets[:, self.wrist_dof_indices] = 0.0
+        targets[:, self.j0_indices] = targets[:, self.j1_indices]
 
         self.cur_targets[:] = targets
         self.prev_targets[:] = targets
@@ -529,127 +595,101 @@ class ShadowHandHora(VecTask):
         self._debug_print_root_state_once()
 
         with torch.no_grad():
-            # ─────────────────────────────────────────────
-            # exp8_reward_v2 — 基于 exp5/6/7 三次失败诊断的重设计
-            # ─────────────────────────────────────────────
+            # === Sim-derived quantities (all from IsaacGym tensors) ===
+            finger_pos = self.rigid_body_states[:, self.fingertip_body_indices, 0:3]
+            palm_pos   = self.rigid_body_states[:, self.palm_body_index, 0:3]
+            obj_pos    = self.object_pos
+            tip_forces = self.contact_forces[:, self.fingertip_body_indices, :]
 
-            # [1] 距离：改为线性，永不饱和
-            #     依据：tanh 在近处梯度饱和，policy 感受不到"更近"的价值
-            tip_pos = self.rigid_body_states[:, self.fingertip_body_indices, 0:3]  # [N,5,3]
-            obj_pos_exp = self.object_pos.unsqueeze(1)                             # [N,1,3]
-            tip_dists = torch.norm(tip_pos - obj_pos_exp, dim=-1)                  # [N,5]
-            max_tip_dist = tip_dists.max(dim=-1)[0]                                # [N]
-            r_reach = -3.0 * max_tip_dist
-            # 预期：max_dist=10cm → -0.30；max_dist=2cm → -0.06
-            # 关键：悬停时 max_dist≈6cm → -0.18/step，200步 = -36 损失（亏损！）
+            # === Distances ===
+            d_palm = torch.norm(palm_pos - obj_pos, dim=-1)
+            d_tip  = torch.norm(finger_pos - obj_pos.unsqueeze(1), dim=-1).mean(dim=-1)
 
-            # [2] 删除 r_contact —— 根源 bug
-            #     依据：旧 r_contact 在悬停轻触状态下贡献 170/137，主要收益来源
-            #          policy 没动机下去真抓，只要维持 5 指轻触即可
-            # （此处无代码，已删除）
+            # === Contact ===
+            tip_force_mag = torch.norm(tip_forces, dim=-1)
+            F_total       = tip_force_mag.sum(dim=-1)
+            n_contact     = (tip_force_mag > self.r1_contact_force_thresh).float().sum(dim=-1)
 
-            # [3] 抬球速度奖励：抓到球的瞬间就给信号
-            #     依据：当前 r_lift_low 要 4cm 才触发，但抓到球那一瞬间 ball_vz 立刻 > 0
-            #          速度奖励比位置奖励提前 ~30 步出现 → 更稠密梯度
-            ball_lin_vel = self.root_state_tensor[self.object_indices, 7:10]        # [N,3]
-            ball_vz = ball_lin_vel[:, 2]                                            # [N]
-            r_lift_vel = 10.0 * torch.clamp(ball_vz, 0.0, 0.5)
-            # 预期：球静止 → 0；球被推 0.1 m/s → 1.0/step；封顶 5/step
+            # === Lift ===
+            delta_z = (obj_pos[:, 2] - self.object_init_z).clamp(min=0.0)
 
-            # [4] 多级抬起 bonus —— 门槛拉低、梯度变密
-            #     依据：旧阈值 4/8/15cm 全没触发过，workspace 最多抬 10cm
-            #          新阈值 1/3/6cm 对应 "离地/明显抬起/可拿走"
-            h_above = self.object_pos[:, 2] - self.object_rest_height
-            r_lift_stage1 = 10.0 * (h_above > 0.01).float()                        # 1cm：离地就赚 10
-            r_lift_stage2 = 30.0 * (h_above > 0.03).float()                        # 3cm：明显抬起 +30
-            r_lift_stage3 = 60.0 * (h_above > 0.06).float()                        # 6cm：成功抓握 +60
+            # === Stage 1: Reach ===
+            r_reach = torch.exp(-d_palm / self.r1_reach_sigma)
 
-            # [5] 防漂移：手离球太远时惩罚
-            #     依据：exp5 崩塌时手整个漂走，没有拉回机制
-            hand_center = tip_pos.mean(dim=1)                                       # [N,3]
-            hand_ball_dist = torch.norm(hand_center - self.object_pos, dim=-1)      # [N]
-            r_anti_drift = -5.0 * torch.clamp(hand_ball_dist - 0.20, min=0.0)
-            # 预期：hand 在球附近 → 0（无惩罚区）；漂到 30cm → -0.5；漂到 1m → -4
+            # === Stage 2: Grasp (gated by reach) ===
+            r_grasp = r_reach * torch.exp(-d_tip / self.r1_grasp_sigma)
 
-            # [6] 动作惩罚：减弱 5 倍（0.01 → 0.002）
-            #     依据：旧量级占总 reward 15%，与稀疏 reward 对抗
+            # === Stage 3: Contact (gated by grasp) ===
+            r_contact_force = torch.tanh(F_total / self.r1_contact_force_scale)
+            r_contact_count = (n_contact / self.r1_contact_target_count).clamp(0.0, 1.0)
+            r_contact = r_grasp * 0.5 * (r_contact_force + r_contact_count)
+
+            # === Stage 4: Lift (gated by contact) ===
+            r_lift_low  = (delta_z / self.r1_lift_low).clamp(0.0, 1.0)
+            denom_h     = max(self.r1_lift_high - self.r1_lift_low, 1e-6)
+            r_lift_high = ((delta_z - self.r1_lift_low) / denom_h).clamp(0.0, 1.0)
+            r_lift = r_contact * (0.3 * r_lift_low + 0.7 * r_lift_high)
+
+            # === Success ===
+            success_mask = (
+                (delta_z > self.r1_success_dz)
+                & (n_contact >= 2)
+                & (F_total > self.r1_success_force)
+            )
+            r_success = success_mask.float()
+
+            # === Regularization ===
             act = self._debug_last_actions
             if act is not None:
-                action_sqnorm = (act ** 2).sum(dim=-1)
+                r_act = -0.0005 * (act ** 2).sum(dim=-1)
             else:
-                action_sqnorm = torch.zeros(self.num_envs, device=self.device)
-            r_penalty = -0.002 * action_sqnorm
+                r_act = torch.zeros(self.num_envs, device=self.device)
+            r_dofvel = -0.0001 * (self.hand_dof_vel ** 2).sum(dim=-1)
 
-            # ─────────────────────────────────────────────
-            # 总 reward
-            # ─────────────────────────────────────────────
+            # === Total ===
             reward = (
-                r_reach +
-                r_lift_vel +
-                r_lift_stage1 + r_lift_stage2 + r_lift_stage3 +
-                r_anti_drift +
-                r_penalty
+                self.r1_w_reach    * r_reach
+                + self.r1_w_grasp    * r_grasp
+                + self.r1_w_contact  * r_contact
+                + self.r1_w_lift     * r_lift
+                + self.r1_w_success  * r_success
+                + r_act
+                + r_dofvel
             )
             self.rew_buf[:] = reward
 
-            # 记录到 extras 便于 TB 监控
-            if not hasattr(self, '_extras_initialized'):
-                self._extras_initialized = True
-            self.extras["rewards/reach"]      = r_reach.mean()
-            self.extras["rewards/lift_vel"]   = r_lift_vel.mean()
-            self.extras["rewards/lift_s1"]    = r_lift_stage1.mean()
-            self.extras["rewards/lift_s2"]    = r_lift_stage2.mean()
-            self.extras["rewards/lift_s3"]    = r_lift_stage3.mean()
-            self.extras["rewards/anti_drift"] = r_anti_drift.mean()
-            self.extras["rewards/penalty"]    = r_penalty.mean()
-            self.extras["rewards/total"]      = reward.mean()
+            self.extras['r_reach']       = r_reach.mean()
+            self.extras['r_grasp']       = r_grasp.mean()
+            self.extras['r_contact']     = r_contact.mean()
+            self.extras['r_lift']        = r_lift.mean()
+            self.extras['r_success']     = r_success.mean()
+            self.extras['success']       = r_success.mean()
+            self.extras['rewards/total'] = reward.mean()
 
-            # ===== 每 50 个 env-step 写一次 TB，避免太密 =====
             self.rew_log_counter += 1
             if self.rew_log_counter % 50 == 0:
-                step = self.rew_log_counter * self.num_envs  # 换算成 agent steps
-
-                # Reward 分量（全 batch 平均）
-                self.rew_writer.add_scalar('rewards/reach',      r_reach.mean().item(),      step)
-                self.rew_writer.add_scalar('rewards/lift_vel',   r_lift_vel.mean().item(),   step)
-                self.rew_writer.add_scalar('rewards/lift_s1',    r_lift_stage1.mean().item(), step)
-                self.rew_writer.add_scalar('rewards/lift_s2',    r_lift_stage2.mean().item(), step)
-                self.rew_writer.add_scalar('rewards/lift_s3',    r_lift_stage3.mean().item(), step)
-                self.rew_writer.add_scalar('rewards/anti_drift', r_anti_drift.mean().item(), step)
-                self.rew_writer.add_scalar('rewards/penalty',    r_penalty.mean().item(),    step)
-                self.rew_writer.add_scalar('rewards/total',      reward.mean().item(),       step)
-
-                # 诊断指标（关键！）
-                tip_dist = torch.norm(
-                    tip_pos - obj_pos_exp, dim=-1
-                ).mean(dim=-1)
-                ball_h = self.object_pos[:, 2] - self.object_rest_height
-                hand_center = tip_pos.mean(dim=1)
-                hand_ball_dist = torch.norm(hand_center - self.object_pos, dim=-1)
-
-                self.rew_writer.add_scalar('diagnostics/ball_height',  
-                                            ball_h.mean().item(), step)
-                self.rew_writer.add_scalar('diagnostics/mean_tip_dist', 
-                                            tip_dist.mean().item(), step)
-                self.rew_writer.add_scalar('diagnostics/hand_ball_dist', 
-                                            hand_ball_dist.mean().item(), step)
-                self.rew_writer.add_scalar('diagnostics/ball_vz', 
-                                            ball_vz.mean().item(), step)
-
-                # 成功率指标
-                success_rate_1cm = (ball_h > 0.01).float().mean().item()
-                success_rate_3cm = (ball_h > 0.03).float().mean().item()
-                success_rate_6cm = (ball_h > 0.06).float().mean().item()
-                self.rew_writer.add_scalar('diagnostics/success_rate_1cm', success_rate_1cm, step)
-                self.rew_writer.add_scalar('diagnostics/success_rate_3cm', success_rate_3cm, step)
-                self.rew_writer.add_scalar('diagnostics/success_rate_6cm', success_rate_6cm, step)
+                step = self.rew_log_counter * self.num_envs
+                self.rew_writer.add_scalar('rewards/reach',   r_reach.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/grasp',   r_grasp.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/contact', r_contact.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/lift',    r_lift.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/success', r_success.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/act',     r_act.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/dofvel',  r_dofvel.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/total',   reward.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/d_palm',    d_palm.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/d_tip',     d_tip.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/delta_z',   delta_z.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/F_total',   F_total.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/n_contact', n_contact.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/success',   r_success.mean().item(), step)
 
         self._compute_observations()
         self._update_priv_info()
 
         self.reset_buf = torch.where(
             torch.logical_or(
-                torch.less(self.object_pos[:, 2], self.reset_z_threshold),
+                torch.less(self.object_pos[:, 2], self.object_init_z - 0.10),
                 torch.greater_equal(self.progress_buf, self.max_episode_length),
             ),
             torch.ones_like(self.reset_buf),
@@ -692,8 +732,7 @@ class ShadowHandHora(VecTask):
             priv_shape = tuple(self.priv_info_buf.shape) if hasattr(self, 'priv_info_buf') else None
             proprio_hist_shape = tuple(self.proprio_hist_buf.shape) if hasattr(self, 'proprio_hist_buf') else None
 
-            wrist_target_maxabs = self.cur_targets[:, self.wrist_dof_indices].abs().max().item()
-            wrist_pos_maxabs = self.hand_dof_pos[:, self.wrist_dof_indices].abs().max().item()
+
 
             tip_forces = self.contact_forces[:, self.fingertip_body_indices, :]
             tip_force_mag = tip_forces.norm(dim=-1)
@@ -707,8 +746,6 @@ class ShadowHandHora(VecTask):
             f'priv_shape={priv_shape} '
             f'proprio_hist_shape={proprio_hist_shape} '
             f'obs_nonfinite={int(obs_nonfinite)} '
-            f'wrist_target_maxabs={wrist_target_maxabs:.3e} '
-            f'wrist_pos_maxabs={wrist_pos_maxabs:.3e} '
             f'tip_contact_force_mean={tip_force_mean:.3e}'
         )
 
@@ -728,25 +765,14 @@ class ShadowHandHora(VecTask):
         if self.torque_control:
             torques = self.p_gain * (self.cur_targets - self.hand_dof_pos) - self.d_gain * self.hand_dof_vel
 
-            # lock wrist around 0 even in torque mode
-            torques[:, self.wrist_dof_indices] = (
-                self.wrist_p_gain * (0.0 - self.hand_dof_pos[:, self.wrist_dof_indices])
-                - self.wrist_d_gain * self.hand_dof_vel[:, self.wrist_dof_indices]
-            )
-
             torques[:, self.controlled_dof_indices] = torch.clamp(
                 torques[:, self.controlled_dof_indices],
                 -self.finger_torque_limit,
                 self.finger_torque_limit,
             )
-            torques[:, self.wrist_dof_indices] = torch.clamp(
-                torques[:, self.wrist_dof_indices],
-                -self.wrist_torque_limit,
-                self.wrist_torque_limit,
-            )
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torques))
         else:
-            self.cur_targets[:, self.wrist_dof_indices] = 0.0
+            self.cur_targets[:, self.j0_indices] = self.cur_targets[:, self.j1_indices]
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.cur_targets))
 
     def _compute_observations(self):
@@ -846,13 +872,28 @@ class ShadowHandHora(VecTask):
 
         hand_asset_options = gymapi.AssetOptions()
         hand_asset_options.flip_visual_attachments = False
-        hand_asset_options.fix_base_link = self.hand_fix_base_link
+        hand_asset_options.fix_base_link = False
         hand_asset_options.collapse_fixed_joints = True
         hand_asset_options.disable_gravity = True
         hand_asset_options.thickness = 0.001
-        hand_asset_options.angular_damping = 0.01
-        hand_asset_options.default_dof_drive_mode = int(gymapi.DOF_MODE_EFFORT) if self.torque_control else int(gymapi.DOF_MODE_POS)
+        hand_asset_options.angular_damping = 100
+        hand_asset_options.linear_damping = 100
+        hand_asset_options.default_dof_drive_mode = int(gymapi.DOF_MODE_POS)
         self.hand_asset = self.gym.load_asset(self.sim, asset_root, hand_asset_file, hand_asset_options)
+
+        assert self.hand_asset is not None, \
+            f'load_asset failed: root={asset_root} file={hand_asset_file}'
+
+        n_dof  = self.gym.get_asset_dof_count(self.hand_asset)
+        n_body = self.gym.get_asset_rigid_body_count(self.hand_asset)
+        n_act  = self.gym.get_asset_actuator_count(self.hand_asset)
+        n_tdn  = self.gym.get_asset_tendon_count(self.hand_asset)
+        print(f'[HORA] MJCF loaded: {n_dof} DOF, {n_body} bodies, {n_act} actuators, {n_tdn} tendons')
+        assert n_dof == 22, f'expected 22 finger DOF (wrist via freejoint root), got {n_dof}'
+        assert n_act == 18, f'expected 18 finger actuators (WRJ disabled), got {n_act}'
+        assert n_tdn == 4,  f'expected 4 J1->J0 tendons, got {n_tdn}'
+
+        tendon_count = self.gym.get_asset_tendon_count(self.hand_asset)
 
         self.object_asset_list = []
         for object_type in self.object_type_list:
@@ -894,16 +935,22 @@ class ShadowHandHora(VecTask):
 
     def _setup_reward_config(self, r_config):
         r_config = r_config or {}
-        # All values below come from DAPG (Rajeswaran 2018) Relocate task,
-        # DexPoint (Qin 2022) default hyperparameters, and HORA (Qi 2022).
-        self.reach_alpha = float(r_config.get('reachAlpha', 10.0))
-        self.lift_bonus_low = float(r_config.get('liftBonusLow', 2.0))
-        self.lift_bonus_mid = float(r_config.get('liftBonusMid', 10.0))
-        self.lift_bonus_high = float(r_config.get('liftBonusHigh', 20.0))
-        self.lift_height_low = float(r_config.get('liftHeightLow', 0.04))
-        self.lift_height_mid = float(r_config.get('liftHeightMid', 0.08))
-        self.lift_height_high = float(r_config.get('liftHeightHigh', 0.15))
-        self.action_penalty_scale = float(r_config.get('actionPenaltyScale', 0.01))
+        # ===== R1 reward parameters (sphere grasp, sim-derived) =====
+        self.r1_reach_sigma          = float(r_config.get('reachSigma', 0.10))
+        self.r1_grasp_sigma          = float(r_config.get('graspSigma', 0.03))
+        self.r1_contact_force_thresh = float(r_config.get('contactForceThresh', 0.5))
+        self.r1_contact_force_scale  = float(r_config.get('contactForceScale', 3.0))
+        self.r1_contact_target_count = float(r_config.get('contactTargetCount', 3.0))
+        self.r1_lift_low             = float(r_config.get('liftLow', 0.02))
+        self.r1_lift_high            = float(r_config.get('liftHigh', 0.07))
+        self.r1_success_dz           = float(r_config.get('successDz', 0.05))
+        self.r1_success_force        = float(r_config.get('successForce', 1.0))
+        weights = r_config.get('weights', {}) or {}
+        self.r1_w_reach    = float(weights.get('reach',   0.5))
+        self.r1_w_grasp    = float(weights.get('grasp',   1.0))
+        self.r1_w_contact  = float(weights.get('contact', 1.0))
+        self.r1_w_lift     = float(weights.get('lift',    3.0))
+        self.r1_w_success  = float(weights.get('success', 10.0))
         self.object_rest_height = float(r_config.get('objectRestHeight', 0.046))
 
     def _setup_object_info(self, o_config):

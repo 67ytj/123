@@ -8,8 +8,8 @@ env:
   # 3帧历史 * (qpos22 + target22) = 132
   numObservations: 132
 
-  # 22 指 + 3 手臂 xyz
-  numActions: 25
+  # 18 finger actuator + 3 手臂 xyz
+  numActions: 21
 
   envSpacing: 0.5
   episodeLength: 200            # ⚠ 改动：原 400，对"下降→抓→抬"足够,训练更快
@@ -54,16 +54,23 @@ env:
     privInfoDim: 9
 
   reward:
-    # All values from DAPG (Rajeswaran 2018) + DexPoint (Qin 2022). Do not hand-tune.
-    reachAlpha: 5.0             # DexPoint: r_reach = 1 - tanh(alpha * d) [降低让梯度在更远距离有效]
-    liftBonusLow: 2.0           # DAPG Relocate stage 1 bonus
-    liftBonusMid: 10.0          # DAPG Relocate stage 2 bonus
-    liftBonusHigh: 20.0         # DAPG Relocate stage 3 bonus
-    liftHeightLow: 0.02         # 原 0.04 → 改 0.02（2cm 就能触发，梯度更密集）
-    liftHeightMid: 0.08         # DAPG 8cm threshold
-    liftHeightHigh: 0.15        # DAPG 15cm threshold
-    actionPenaltyScale: 0.01    # HORA default
-    objectRestHeight: 0.046     # ball radius (0.058) × base scale (0.8)
+    # === R1 reward (sphere grasp, sim-derived only, gated 4-stage) ===
+    reachSigma:          0.10
+    graspSigma:          0.03
+    contactForceThresh:  0.5
+    contactForceScale:   3.0
+    contactTargetCount:  3.0
+    liftLow:             0.02
+    liftHigh:            0.07
+    successDz:           0.05
+    successForce:        1.0
+    weights:
+      reach:    0.5
+      grasp:    1.0
+      contact:  1.0
+      lift:     3.0
+      success:  10.0
+    objectRestHeight:    0.046
 
   baseObjScale: 0.8
 
@@ -114,7 +121,13 @@ env:
 
   asset:
     # 注意:这里是相对于 asset_root 的路径(跟 Allegro 写法一致)
-    handAsset: 'assets/shadow_hand_description/shadowhand_with_fingertips.urdf'
+    handAsset: 'mjcf/open_ai_assets/hand/shadow_hand.xml'
+
+  dfcdata:
+    enable: true
+    sourcePath: 'assets/datasetv4.1_posedata.npy'
+    targetScale: 0.08
+    objectKeywords: ['Apple', 'Orange', 'Bottle', 'Egg', 'Sphere', 'Ball']
 
   enableCameraSensors: False
 

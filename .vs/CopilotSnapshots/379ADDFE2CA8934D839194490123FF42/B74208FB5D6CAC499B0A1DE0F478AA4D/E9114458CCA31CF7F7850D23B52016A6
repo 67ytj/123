@@ -1,0 +1,955 @@
+﻿import os
+import os
+import torch
+import numpy as np
+
+from torch.utils.tensorboard import SummaryWriter
+from isaacgym import gymtorch
+from isaacgym import gymapi
+from isaacgym.torch_utils import to_torch, unscale, tensor_clamp, torch_rand_float
+
+from hora.utils.dfcdata import DFCDataPool
+
+from .base.vec_task import VecTask
+
+
+ACTUATOR_NAMES_18 = [
+    'robot0:FFJ3', 'robot0:FFJ2', 'robot0:FFJ1',
+    'robot0:MFJ3', 'robot0:MFJ2', 'robot0:MFJ1',
+    'robot0:RFJ3', 'robot0:RFJ2', 'robot0:RFJ1',
+    'robot0:LFJ4', 'robot0:LFJ3', 'robot0:LFJ2', 'robot0:LFJ1',
+    'robot0:THJ4', 'robot0:THJ3', 'robot0:THJ2', 'robot0:THJ1', 'robot0:THJ0',
+]
+
+FINGER_DOF_NAMES_22 = [
+    'robot0:FFJ3', 'robot0:FFJ2', 'robot0:FFJ1', 'robot0:FFJ0',
+    'robot0:MFJ3', 'robot0:MFJ2', 'robot0:MFJ1', 'robot0:MFJ0',
+    'robot0:RFJ3', 'robot0:RFJ2', 'robot0:RFJ1', 'robot0:RFJ0',
+    'robot0:LFJ4', 'robot0:LFJ3', 'robot0:LFJ2', 'robot0:LFJ1', 'robot0:LFJ0',
+    'robot0:THJ4', 'robot0:THJ3', 'robot0:THJ2', 'robot0:THJ1', 'robot0:THJ0',
+]
+
+J1_TO_J0_PAIRS = [
+    ('robot0:FFJ1', 'robot0:FFJ0'),
+    ('robot0:MFJ1', 'robot0:MFJ0'),
+    ('robot0:RFJ1', 'robot0:RFJ0'),
+    ('robot0:LFJ1', 'robot0:LFJ0'),
+]
+
+WRIST_NAMES = ['robot0:WRJ1', 'robot0:WRJ0']
+PALM_BODY = 'robot0:palm'
+FINGERTIP_BODIES = ['robot0:ffdistal', 'robot0:mfdistal', 'robot0:rfdistal', 'robot0:lfdistal', 'robot0:thdistal']
+
+
+def euler_xy_to_quat(eul_xy):
+    rx, ry = eul_xy[..., 0], eul_xy[..., 1]
+    cx, sx = torch.cos(rx * 0.5), torch.sin(rx * 0.5)
+    cy, sy = torch.cos(ry * 0.5), torch.sin(ry * 0.5)
+    qw = cx * cy
+    qx = sx * cy
+    qy = cx * sy
+    qz = -sx * sy
+    return torch.stack([qx, qy, qz, qw], dim=-1)
+
+
+class ShadowHandHora(VecTask):
+    def __init__(self, config, sim_device, graphics_device_id, headless):
+        self.config = config
+
+        hand_cfg = (config.get('env', {}) or {}).get('hand', {}) or {}
+        self.hand_fix_base_link = bool(hand_cfg.get('fixBaseLink', True))
+        self.hand_kinematic_base = bool(hand_cfg.get('kinematicBase', False))
+        self.hand_approach_height = float(hand_cfg.get('approachHeight', 0.15))
+        self.hand_approach_alpha = float(hand_cfg.get('approachAlpha', 0.2))
+        self.hand_init_pos = hand_cfg.get('initPos', [0.0, 0.0, 0.19])
+        self.hand_init_rot = hand_cfg.get('initRot', None)  # quaternion [x,y,z,w]
+        self.hand_extra_yaw_deg = float(hand_cfg.get('extraYawDeg', 0.0))
+        self.hand_align_to_object = bool(hand_cfg.get('alignToObject', True))
+
+        self.policy_controls_arm = bool(hand_cfg.get('policyControlsArm', False))
+        self.fix_hand_inertia = bool(hand_cfg.get('fixInertia', False))
+
+        # If policy controls arm xyz, the base must be movable and we should not use the auto-approach kinematic mode.
+        if self.policy_controls_arm:
+            self.hand_fix_base_link = False
+            self.hand_kinematic_base = False
+
+        ctrl_cfg = (config.get('env', {}) or {}).get('controller', {}) or {}
+        self._arm_xyz_action_scale_cfg = float(ctrl_cfg.get('arm_xyz_action_scale', 0.005))
+        ws = ctrl_cfg.get('arm_xyz_workspace', {}) or {}
+        self._arm_xyz_ws_x = ws.get('x', [-0.15, 0.15])
+        self._arm_xyz_ws_y = ws.get('y', [-0.15, 0.15])
+        self._arm_xyz_ws_z = ws.get('z', [0.05, 0.35])
+
+        # Explicitly initialize controller scalars (VecTask also reads them, but keeping local defaults makes this task robust).
+        self.torque_control = bool(ctrl_cfg.get('torque_control', False))
+        self.p_gain = float(ctrl_cfg.get('pgain', 3.0))
+        self.d_gain = float(ctrl_cfg.get('dgain', 0.1))
+
+        if self.hand_kinematic_base and self.hand_fix_base_link:
+            print('[ShadowHandHora] kinematicBase=True requires movable base; overriding fixBaseLink=False')
+            self.hand_fix_base_link = False
+
+        debug_cfg = (config.get('env', {}) or {}).get('debug', {}) or {}
+        self._debug_enable = bool(debug_cfg.get('enable', False))
+        self._debug_log_once = bool(debug_cfg.get('logOnce', True))
+        self._debug_log_interval = int(debug_cfg.get('interval', 0) or 0)
+        self._debug_step_counter = 0
+        self._debug_printed_once = False
+        self._debug_last_actions = None
+
+        self._setup_domain_rand_config(config['env']['randomization'])
+        self._setup_priv_option_config(config['env']['privInfo'])
+        self._setup_object_info(config['env']['object'])
+        self._setup_reward_config(config['env']['reward'])
+
+        self.base_obj_scale = config['env']['baseObjScale']
+        self.aggregate_mode = self.config['env']['aggregateMode']
+        self.up_axis = 'z'
+        self.reset_z_threshold = self.config['env']['reset_height_threshold']
+        self.max_episode_length = self.config['env']['episodeLength']
+
+        super().__init__(config, sim_device, graphics_device_id, headless)
+
+        controller_cfg = (config.get('env', {}) or {}).get('controller', {}) or {}
+        base_kp = float(controller_cfg.get('pgain', 0.0) or 0.0)
+        base_kd = float(controller_cfg.get('dgain', 0.0) or 0.0)
+        self.finger_torque_limit = float(controller_cfg.get('finger_torque_limit', 0.5))
+        self.wrist_p_gain = float(controller_cfg.get('wrist_pgain', base_kp * 20.0 if base_kp > 0 else 50.0))
+        self.wrist_d_gain = float(controller_cfg.get('wrist_dgain', base_kd * 20.0 if base_kd > 0 else 1.0))
+        self.wrist_torque_limit = float(controller_cfg.get('wrist_torque_limit', 2.0))
+
+        if self.viewer:
+            cam_pos = gymapi.Vec3(0.3, 0.3, 0.9)
+            cam_target = gymapi.Vec3(0.0, 0.0, 0.25)
+            self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
+
+        print(
+            '[ShadowHandHora] hand config:',
+            f'fixBaseLink={self.hand_fix_base_link}',
+            f'kinematicBase={self.hand_kinematic_base}',
+            f'policyControlsArm={self.policy_controls_arm}',
+            f'alignToObject={self.hand_align_to_object}',
+            f'extraYawDeg={self.hand_extra_yaw_deg}',
+        )
+
+        self._printed_root_state_once = False
+
+        self._acquire_tensors()
+        self._refresh_gym()
+
+        if self.hand_align_to_object:
+            self._align_hand_root_to_object(env_ids=None)
+            hand_actor_ids = self.hand_indices.to(torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_state_tensor),
+                gymtorch.unwrap_tensor(hand_actor_ids),
+                len(hand_actor_ids),
+            )
+
+            # Make sure rigid body states reflect the aligned root before we derive offsets.
+            self.gym.refresh_actor_root_state_tensor(self.sim)
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+            # Capture aligned root as canonical init pose for resets.
+            if getattr(self, 'hand_init_state', None) is not None:
+                self.hand_init_state[:, 0:7] = self.root_state_tensor[self.hand_indices, 0:7].clone()
+                self.hand_init_state[:, 7:13] = 0.0
+
+        # Arm control parameters (tensors must be created after `self.device` is set by VecTask).
+        self.arm_xyz_action_scale = float(self._arm_xyz_action_scale_cfg)
+        self.arm_xyz_lower = torch.tensor(
+            [
+                float(self._arm_xyz_ws_x[0]),
+                float(self._arm_xyz_ws_y[0]),
+                float(self._arm_xyz_ws_z[0]),
+            ],
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.arm_xyz_upper = torch.tensor(
+            [
+                float(self._arm_xyz_ws_x[1]),
+                float(self._arm_xyz_ws_y[1]),
+                float(self._arm_xyz_ws_z[1]),
+            ],
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        # Offset from actor root to palm in world coordinates (used to apply workspace limits on the palm).
+        root_pos = self.root_state_tensor[self.hand_indices, 0:3]
+        palm_pos = self.rigid_body_states[:, self.palm_body_index, 0:3]
+        self._palm_root_offset = palm_pos - root_pos
+
+        # Lock base orientation for the entire episode (policy only controls xyz translation).
+        self._locked_root_rot = self.root_state_tensor[self.hand_indices, 3:7].clone()
+
+        self.num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
+        self.prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self.cur_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self.obs_hist = torch.zeros((self.num_envs, 3, 44), device=self.device, dtype=torch.float)
+
+        self.prev_targets[:, :self.num_hand_dofs] = self.hand_dof_pos.clone()
+        self.cur_targets[:, :self.num_hand_dofs] = self.hand_dof_pos.clone()
+        self.prev_targets[:, self.wrist_dof_indices] = 0.0
+        self.cur_targets[:, self.wrist_dof_indices] = 0.0
+
+        # cache of initial hand root state (filled in _create_envs)
+        if not hasattr(self, 'hand_init_state'):
+            self.hand_init_state = None
+
+        # ===== Reward 分量 TensorBoard logger =====
+        # 从环境变量读取 output_name（由训练脚本设置）
+        output_name = os.environ.get('HORA_OUTPUT_NAME', 'ShadowHandHora/default')
+        rew_log_dir = os.path.join('outputs', output_name, 'reward_components')
+        os.makedirs(rew_log_dir, exist_ok=True)
+        self.rew_writer = SummaryWriter(log_dir=rew_log_dir)
+        self.rew_log_counter = 0
+        print(f'[ShadowHandHora] Reward components TB → {rew_log_dir}')
+
+        self.object_init_z = torch.full(
+            (self.num_envs,),
+            float(self.config['env']['object']['initPos'][2]),
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        dfc_cfg = (self.config.get('env', {}) or {}).get('dfcdata', {}) or {}
+        if dfc_cfg.get('enable', False):
+            self.dfc_pool = DFCDataPool(
+                source_path=dfc_cfg['sourcePath'],
+                target_scale=dfc_cfg.get('targetScale', 0.08),
+            )
+            candidates = self.dfc_pool.find_objects(dfc_cfg.get('objectKeywords', []))
+            assert candidates, f"no DFCData object matches {dfc_cfg.get('objectKeywords', [])}"
+            self.current_object_code = candidates[0]
+            print(f'[HORA] DFCData object: {self.current_object_code} ({len(candidates)} candidates)')
+            self.q_star_22 = torch.zeros(self.num_envs, 22, device=self.device)
+        else:
+            self.dfc_pool = None
+            self.current_object_code = None
+            self.q_star_22 = torch.zeros(self.num_envs, 22, device=self.device)
+
+    def _allocate_task_buffer(self, num_envs):
+        self.num_env_factors = self.config['env']['hora']['privInfoDim']
+        self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
+        hora_cfg = (self.config.get('env', {}) or {}).get('hora', {}) or {}
+        self.prop_hist_len = int(hora_cfg.get('propHistoryLen', 30))
+        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 44), device=self.device, dtype=torch.float)
+
+    def _create_envs(self, num_envs, spacing, num_per_row):
+        self._create_ground_plane()
+        lower = gymapi.Vec3(-spacing, -spacing, 0.0)
+        upper = gymapi.Vec3(spacing, spacing, spacing)
+
+        self._create_object_asset()
+
+        self.num_hand_dofs = self.gym.get_asset_dof_count(self.hand_asset)
+        hand_dof_props = self.gym.get_asset_dof_properties(self.hand_asset)
+        self.hand_dof_lower_limits = to_torch(hand_dof_props['lower'], device=self.device)
+        self.hand_dof_upper_limits = to_torch(hand_dof_props['upper'], device=self.device)
+
+        if self.torque_control:
+            hand_dof_props['driveMode'][:] = gymapi.DOF_MODE_EFFORT
+            hand_dof_props['stiffness'][:] = 0.0
+            hand_dof_props['damping'][:] = 0.0
+        else:
+            hand_dof_props['driveMode'][:] = gymapi.DOF_MODE_POS
+            hand_dof_props['stiffness'][:] = self.p_gain
+            hand_dof_props['damping'][:] = self.d_gain
+
+        hand_pose, obj_pose = self._init_object_pose()
+
+        def _set_diag_inertia(p, ixx, iyy, izz):
+            # `RigidBodyProperties.inertia` is a `gymapi.Mat33`.
+            p.inertia.x = gymapi.Vec3(float(ixx), 0.0, 0.0)
+            p.inertia.y = gymapi.Vec3(0.0, float(iyy), 0.0)
+            p.inertia.z = gymapi.Vec3(0.0, 0.0, float(izz))
+
+        # Cache body names from asset — body *properties* must be read per-actor below (older IsaacGym API).
+        asset_body_names = None
+        if getattr(self, 'fix_hand_inertia', False):
+            body_count = self.gym.get_asset_rigid_body_count(self.hand_asset)
+            asset_body_names = [self.gym.get_asset_rigid_body_name(self.hand_asset, i) for i in range(body_count)]
+
+        self.envs = []
+        self.hand_indices = []
+        self.object_indices = []
+        self.object_init_state = []
+
+        for i in range(num_envs):
+            do_print = (i < 3 or i == num_envs - 1)
+            if do_print:
+                print(f'[ShadowHandHora][env-loop] iter {i}/{num_envs} start')
+
+            env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
+            hand_actor = self.gym.create_actor(env_ptr, self.hand_asset, hand_pose, 'hand', i, -1, 0)
+            self.gym.set_actor_dof_properties(env_ptr, hand_actor, hand_dof_props)
+
+            # Fix obviously-wrong inertias from the URDF at runtime (per-actor, older IsaacGym API).
+            if asset_body_names is not None:
+                actor_body_props = self.gym.get_actor_rigid_body_properties(env_ptr, hand_actor)
+                for bi, name in enumerate(asset_body_names):
+                    p = actor_body_props[bi]
+                    lname = str(name).lower()
+                    if any(k in lname for k in ('distal', 'middle', 'proximal', 'knuckle', 'hub', 'base', 'metacarpal', 'tip')):
+                        p.mass = max(float(p.mass), 0.005)
+                        _set_diag_inertia(p, 5e-6, 5e-6, 5e-6)
+                    elif lname == 'palm':
+                        _set_diag_inertia(p, 3e-4, 3e-4, 3e-4)
+                    elif lname == 'forearm':
+                        _set_diag_inertia(p, 5e-3, 5e-3, 1e-3)
+                self.gym.set_actor_rigid_body_properties(env_ptr, hand_actor, actor_body_props, False)
+
+            self.hand_indices.append(self.gym.get_actor_index(env_ptr, hand_actor, gymapi.DOMAIN_SIM))
+
+            object_asset = self.object_asset_list[0]
+            object_actor = self.gym.create_actor(env_ptr, object_asset, obj_pose, 'object', i, 0, 0)
+            self.gym.set_actor_scale(env_ptr, object_actor, float(self.base_obj_scale))
+            self.object_indices.append(self.gym.get_actor_index(env_ptr, object_actor, gymapi.DOMAIN_SIM))
+
+            self.object_init_state.append([
+                obj_pose.p.x, obj_pose.p.y, obj_pose.p.z,
+                obj_pose.r.x, obj_pose.r.y, obj_pose.r.z, obj_pose.r.w,
+                0, 0, 0, 0, 0, 0,
+            ])
+
+            self.envs.append(env_ptr)
+
+            if do_print:
+                print(f'[ShadowHandHora][env-loop] iter {i}/{num_envs} END, envs len={len(self.envs)}')
+
+        assert len(self.envs) == num_envs == self.num_envs, \
+            f'[ShadowHandHora] env loop ran {len(self.envs)} times, expected num_envs={num_envs}, self.num_envs={self.num_envs}'
+
+        self.hand_indices = to_torch(self.hand_indices, dtype=torch.long, device=self.device)
+        self.object_indices = to_torch(self.object_indices, dtype=torch.long, device=self.device)
+        self.object_init_state = to_torch(self.object_init_state, dtype=torch.float, device=self.device).view(self.num_envs, 13)
+
+        # cache initial hand root state (used when base is not fixed)
+        self.hand_init_state = torch.zeros((self.num_envs, 13), device=self.device, dtype=torch.float)
+        self.hand_init_state[:, 0] = float(hand_pose.p.x)
+        self.hand_init_state[:, 1] = float(hand_pose.p.y)
+        self.hand_init_state[:, 2] = float(hand_pose.p.z)
+        self.hand_init_state[:, 3] = float(hand_pose.r.x)
+        self.hand_init_state[:, 4] = float(hand_pose.r.y)
+        self.hand_init_state[:, 5] = float(hand_pose.r.z)
+        self.hand_init_state[:, 6] = float(hand_pose.r.w)
+
+        env0 = self.envs[0]
+        hand0 = self.gym.find_actor_handle(env0, 'hand')
+        dof_names = self.gym.get_actor_dof_names(env0, hand0)
+        body_names = self.gym.get_actor_rigid_body_names(env0, hand0)
+
+        print('[ShadowHandHora] DOF names:', dof_names)
+        print('[ShadowHandHora] Body names:', body_names)
+
+        dof_name_to_idx = {name: i for i, name in enumerate(dof_names)}
+        for name in ('WRJ1', 'WRJ2'):
+            if name not in dof_name_to_idx:
+                raise RuntimeError(f'[ShadowHandHora] Missing wrist DOF {name}. Available: {dof_names}')
+
+        self.wrist_dof_indices = to_torch(
+            [dof_name_to_idx['WRJ2'], dof_name_to_idx['WRJ1']],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        controlled = [i for i, name in enumerate(dof_names) if name not in ('WRJ1', 'WRJ2')]
+        if len(controlled) != 22:
+            raise RuntimeError(f'[ShadowHandHora] Expected 22 non-wrist DOFs, got {len(controlled)}. Available: {dof_names}')
+        self.controlled_dof_indices = to_torch(controlled, dtype=torch.long, device=self.device)
+
+        # Bend-only joints for pre-grasp bias (exclude spread/roll/thumb-opposition DOFs).
+        _bend_names = set()
+        for prefix in ('FF', 'MF', 'RF', 'LF'):
+            _bend_names.update([f'{prefix}J1', f'{prefix}J2', f'{prefix}J3'])
+        _bend_names.update(['THJ1', 'THJ2'])   # thumb flexion DOFs only
+        self.bend_dof_indices = to_torch(
+            [i for i, name in enumerate(dof_names) if name in _bend_names],
+            dtype=torch.long, device=self.device,
+        )
+        print(f'[ShadowHandHora] bend DOFs ({len(self.bend_dof_indices)}):',
+              [dof_names[int(i)] for i in self.bend_dof_indices])
+
+        body_name_to_idx = {name: i for i, name in enumerate(body_names)}
+
+        if 'palm' not in body_name_to_idx:
+            raise RuntimeError(f"[ShadowHandHora] Missing 'palm' rigid body. Available: {body_names}")
+        self.palm_body_index = int(body_name_to_idx['palm'])
+
+        tip_names = ['fftip', 'mftip', 'rftip', 'lftip', 'thtip']
+        missing_tip = [name for name in tip_names if name not in body_name_to_idx]
+
+        if missing_tip:
+            distal_names = ['ffdistal', 'mfdistal', 'rfdistal', 'lfdistal', 'thdistal']
+            missing_distal = [name for name in distal_names if name not in body_name_to_idx]
+            if missing_distal:
+                raise RuntimeError(
+                    f'[ShadowHandHora] Missing tip bodies {missing_tip} and distal fallback {missing_distal}. Available: {body_names}'
+                )
+            print('[ShadowHandHora] Tip links not found, fallback to distal links:', distal_names)
+            resolved_tip_names = distal_names
+            self.fingertip_body_indices = to_torch(
+                [body_name_to_idx[name] for name in distal_names], dtype=torch.long, device=self.device
+            )
+        else:
+            resolved_tip_names = tip_names
+            self.fingertip_body_indices = to_torch(
+                [body_name_to_idx[name] for name in tip_names], dtype=torch.long, device=self.device
+            )
+
+        print(
+            '[ShadowHandHora] Fingertip bodies:',
+            list(zip(resolved_tip_names, self.fingertip_body_indices.detach().cpu().tolist())),
+        )
+
+    def _acquire_tensors(self):
+        actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
+        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        net_contact_force_tensor = self.gym.acquire_net_contact_force_tensor(self.sim)
+
+        self.root_state_tensor = gymtorch.wrap_tensor(actor_root_state_tensor).view(-1, 13)
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
+        self.contact_forces = gymtorch.wrap_tensor(net_contact_force_tensor).view(self.num_envs, -1, 3)
+
+        self.dof_state_view = self.dof_state.view(self.num_envs, -1, 2)
+        self.hand_dof_state = self.dof_state_view[:, :self.num_hand_dofs]
+        self.hand_dof_pos = self.hand_dof_state[..., 0]
+        self.hand_dof_vel = self.hand_dof_state[..., 1]
+
+    def reset_idx(self, env_ids):
+        if env_ids.numel() == 0:
+            return
+
+        env_ids_long = env_ids.long() if env_ids.dtype != torch.long else env_ids
+
+        # Always reset the object root first.
+        object_actor_ids = self.object_indices[env_ids_long]
+        self.root_state_tensor[object_actor_ids] = self.object_init_state[env_ids_long].clone()
+        self.root_state_tensor[object_actor_ids, 7:13] = 0.0
+        self.object_init_z[env_ids_long] = self.root_state_tensor[object_actor_ids, 2]
+
+        if self.dfc_pool is not None:
+            g = self.dfc_pool.sample(self.current_object_code, len(env_ids_long), device=self.device)
+
+            obj_pos = self.root_state_tensor[object_actor_ids, 0:3].clone()
+            obj_pos[:, 2] = g['obj_z']
+            obj_quat = euler_xy_to_quat(g['obj_eul'])
+            self.root_state_tensor[object_actor_ids, 0:3] = obj_pos
+            self.root_state_tensor[object_actor_ids, 3:7] = obj_quat
+            self.root_state_tensor[object_actor_ids, 7:13] = 0.0
+            self.object_init_z[env_ids_long] = obj_pos[:, 2]
+
+            hand_actor_ids = self.hand_indices[env_ids_long]
+            self.root_state_tensor[hand_actor_ids, 0:3] = g['pos']
+            self.root_state_tensor[hand_actor_ids, 3:7] = g['rot']
+            self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
+
+            dof_view = self.dof_state.view(self.num_envs, -1, 2)
+            dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 0] = g['q']
+            dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 1] = 0.0
+
+            self.cur_targets[env_ids_long] = 0.0
+            self.prev_targets[env_ids_long] = 0.0
+            self.cur_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+            self.prev_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+            self.cur_targets[env_ids_long[:, None], self.wrist_dof_indices[None, :]] = 0.0
+            self.prev_targets[env_ids_long[:, None], self.wrist_dof_indices[None, :]] = 0.0
+
+            self.hand_dof_vel[env_ids_long, :] = 0.0
+            self.hand_dof_pos[env_ids_long, :] = 0.0
+            self.hand_dof_pos[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
+
+            self.q_star_22[env_ids_long] = g['q']
+        else:
+            if not self.hand_fix_base_link and self.hand_init_state is not None:
+                hand_actor_ids = self.hand_indices[env_ids_long]
+                self.root_state_tensor[hand_actor_ids] = self.hand_init_state[env_ids_long].clone()
+                self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
+                self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
+
+                ids_i32 = hand_actor_ids.to(torch.int32)
+                self.gym.set_actor_root_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.root_state_tensor),
+                    gymtorch.unwrap_tensor(ids_i32),
+                    len(ids_i32),
+                )
+                self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+            if self.hand_align_to_object:
+                self._align_hand_root_to_object(env_ids=env_ids_long)
+
+                hand_actor_ids = self.hand_indices[env_ids_long]
+                self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
+
+                hand_actor_ids_i32 = hand_actor_ids.to(torch.int32)
+                self.gym.set_actor_root_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.root_state_tensor),
+                    gymtorch.unwrap_tensor(hand_actor_ids_i32),
+                    len(env_ids_long),
+                )
+
+            self.hand_dof_pos[env_ids_long, :] = 0.0
+            self.hand_dof_vel[env_ids_long, :] = 0.0
+
+            noise = torch_rand_float(-0.05, 0.05, (len(env_ids_long), self.actuator_dof_indices_18.numel()), device=self.device) + 0.35
+            noise = tensor_clamp(
+                noise,
+                self.hand_dof_lower_limits[self.actuator_dof_indices_18],
+                self.hand_dof_upper_limits[self.actuator_dof_indices_18],
+            )
+            self.hand_dof_pos[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+            self.cur_targets[env_ids_long] = 0.0
+            self.prev_targets[env_ids_long] = 0.0
+            self.cur_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+            self.prev_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+            self.cur_targets[env_ids_long[:, None], self.wrist_dof_indices[None, :]] = 0.0
+            self.prev_targets[env_ids_long[:, None], self.wrist_dof_indices[None, :]] = 0.0
+
+        self.cur_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.cur_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+        self.prev_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.prev_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+
+        object_indices = torch.unique(self.object_indices[env_ids_long]).to(torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_state_tensor),
+            gymtorch.unwrap_tensor(object_indices),
+            len(object_indices),
+        )
+
+        hand_indices = self.hand_indices[env_ids_long].to(torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(hand_indices),
+            len(env_ids_long),
+        )
+
+        if not self.torque_control:
+            self.gym.set_dof_position_target_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.cur_targets),
+                gymtorch.unwrap_tensor(hand_indices),
+                len(env_ids_long),
+            )
+
+        self.obs_hist[env_ids_long] = 0.0
+        self.proprio_hist_buf[env_ids_long] = 0.0
+        self.progress_buf[env_ids_long] = 0
+        self.at_reset_buf[env_ids_long] = 1
+
+    def pre_physics_step(self, actions):
+        if actions is None:
+            return
+        expected_dim = 21 if self.policy_controls_arm else 18
+        if actions.shape[1] != expected_dim:
+            raise RuntimeError(f'[ShadowHandHora] Expected actions dim={expected_dim}, got {actions.shape}')
+
+        actions = actions.to(self.device)
+        self._debug_last_actions = actions
+
+        if self.policy_controls_arm:
+            finger_action = actions[:, :18]
+            arm_action = actions[:, 18:21]
+        else:
+            finger_action = actions
+            arm_action = None
+
+        # ---- Arm xyz: integrate root state + workspace clamp ----
+        if self.policy_controls_arm:
+            hand_actor_ids = self.hand_indices
+            # Re-derive palm->root offset each step (robust to drift).
+            palm_pos_now = self.rigid_body_states[:, self.palm_body_index, 0:3]
+            root_pos_now = self.root_state_tensor[hand_actor_ids, 0:3]
+            self._palm_root_offset = (palm_pos_now - root_pos_now).detach()
+
+            cur_xyz = root_pos_now
+            delta = torch.clamp(arm_action, -1.0, 1.0) * self.arm_xyz_action_scale
+
+            # Workspace limits are specified on the palm; convert to root limits via the measured offset.
+            root_lower = self.arm_xyz_lower - self._palm_root_offset
+            root_upper = self.arm_xyz_upper - self._palm_root_offset
+            new_xyz = tensor_clamp(cur_xyz + delta, root_lower, root_upper)
+            actual_delta = new_xyz - cur_xyz
+
+            # Velocity estimate so contact impulses are physically consistent.
+            dt_policy = float(self.sim_params.dt) * float(self.control_freq_inv)
+            lin_vel_est = actual_delta / max(dt_policy, 1e-6)
+
+            self.root_state_tensor[hand_actor_ids, 0:3] = new_xyz
+            self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot
+            self.root_state_tensor[hand_actor_ids, 7:10] = lin_vel_est
+            self.root_state_tensor[hand_actor_ids, 10:13] = 0.0
+
+            hand_ids_i32 = hand_actor_ids.to(torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_state_tensor),
+                gymtorch.unwrap_tensor(hand_ids_i32),
+                len(hand_ids_i32),
+            )
+
+        # ---- Fingers: integrate to joint targets ----
+        finger_action = torch.clamp(finger_action, -1.0, 1.0)
+        targets = self.prev_targets.clone()
+
+        targets[:, self.actuator_dof_indices_18] = targets[:, self.actuator_dof_indices_18] + (1.0 / 48.0) * finger_action
+        targets[:, self.actuator_dof_indices_18] = tensor_clamp(
+            targets[:, self.actuator_dof_indices_18],
+            self.hand_dof_lower_limits[self.actuator_dof_indices_18],
+            self.hand_dof_upper_limits[self.actuator_dof_indices_18],
+        )
+        targets[:, self.j0_indices] = targets[:, self.j1_indices]
+        targets[:, self.wrist_dof_indices] = 0.0
+
+        self.cur_targets[:] = targets
+        self.prev_targets[:] = targets
+
+    def post_physics_step(self):
+        self.progress_buf += 1
+        self.reset_buf[:] = 0
+
+        self._refresh_gym()
+        self._debug_print_root_state_once()
+
+        with torch.no_grad():
+            finger_pos = self.rigid_body_states[:, self.fingertip_body_indices, 0:3]
+            palm_pos = self.rigid_body_states[:, self.palm_body_index, 0:3]
+            obj_pos = self.object_pos
+
+            palm_to_obj = torch.norm(palm_pos - obj_pos, dim=-1)
+            finger_dist = torch.norm(finger_pos - obj_pos.unsqueeze(1), dim=-1).mean(dim=-1)
+
+            r_palm = -1.0 * palm_to_obj
+            r_finger = -0.5 * finger_dist
+
+            lift_z = torch.clamp(obj_pos[:, 2] - self.object_init_z, 0.0, 0.2)
+            r_lift = 5.0 * lift_z
+
+            cur_q22 = self.dof_state.view(self.num_envs, -1, 2)[:, self.finger_dof_indices_22, 0]
+            if self.dfc_pool is not None:
+                r_imit = -0.05 * (cur_q22 - self.q_star_22).abs().sum(dim=-1)
+            else:
+                r_imit = torch.zeros(self.num_envs, device=self.device)
+
+            contact = (torch.norm(finger_pos - obj_pos.unsqueeze(1), dim=-1) < 0.03).float().sum(dim=-1)
+            grasp_ok = (contact >= 2) & (lift_z > 0.03)
+            r_bonus = 50.0 * grasp_ok.float()
+
+            act = self._debug_last_actions
+            if act is not None:
+                r_act = -0.001 * (act ** 2).sum(dim=-1)
+            else:
+                r_act = torch.zeros(self.num_envs, device=self.device)
+
+            reward = r_palm + r_finger + r_lift + r_imit + r_bonus + r_act
+            self.rew_buf[:] = reward
+
+            self.extras['r_palm'] = r_palm.mean()
+            self.extras['r_finger'] = r_finger.mean()
+            self.extras['r_lift'] = r_lift.mean()
+            self.extras['r_bonus'] = r_bonus.mean()
+            self.extras['success'] = grasp_ok.float().mean()
+            self.extras['rewards/total'] = reward.mean()
+            if self.dfc_pool is not None:
+                self.extras['r_imit'] = r_imit.mean()
+
+            self.rew_log_counter += 1
+            if self.rew_log_counter % 50 == 0:
+                step = self.rew_log_counter * self.num_envs
+                self.rew_writer.add_scalar('rewards/palm', r_palm.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/finger', r_finger.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/lift', r_lift.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/bonus', r_bonus.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/act', r_act.mean().item(), step)
+                self.rew_writer.add_scalar('rewards/total', reward.mean().item(), step)
+                if self.dfc_pool is not None:
+                    self.rew_writer.add_scalar('rewards/imit', r_imit.mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/success', grasp_ok.float().mean().item(), step)
+                self.rew_writer.add_scalar('diagnostics/lift_z', lift_z.mean().item(), step)
+
+        self._compute_observations()
+        self._update_priv_info()
+
+        self.reset_buf = torch.where(
+            torch.logical_or(
+                torch.less(self.object_pos[:, 2], self.object_init_z - 0.10),
+                torch.greater_equal(self.progress_buf, self.max_episode_length),
+            ),
+            torch.ones_like(self.reset_buf),
+            self.reset_buf,
+        )
+
+        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(env_ids) > 0:
+            self.reset_idx(env_ids)
+            self._refresh_gym()
+            self._compute_observations()
+            self._update_priv_info()
+
+        self._debug_log_env_interface()
+
+    def _debug_log_env_interface(self):
+        if not self._debug_enable:
+            return
+
+        self._debug_step_counter += 1
+
+        should_print = False
+        if self._debug_log_once and not self._debug_printed_once:
+            should_print = True
+            self._debug_printed_once = True
+        elif self._debug_log_interval > 0 and (self._debug_step_counter % self._debug_log_interval) == 0:
+            should_print = True
+
+        if not should_print:
+            return
+
+        with torch.no_grad():
+            act = self._debug_last_actions
+            act_shape = tuple(act.shape) if act is not None else None
+
+            obs = self.obs_buf
+            obs_shape = tuple(obs.shape)
+            obs_nonfinite = (~torch.isfinite(obs)).sum().item()
+
+            priv_shape = tuple(self.priv_info_buf.shape) if hasattr(self, 'priv_info_buf') else None
+            proprio_hist_shape = tuple(self.proprio_hist_buf.shape) if hasattr(self, 'proprio_hist_buf') else None
+
+            wrist_target_maxabs = self.cur_targets[:, self.wrist_dof_indices].abs().max().item()
+            wrist_pos_maxabs = self.hand_dof_pos[:, self.wrist_dof_indices].abs().max().item()
+
+            tip_forces = self.contact_forces[:, self.fingertip_body_indices, :]
+            tip_force_mag = tip_forces.norm(dim=-1)
+            tip_force_mean = tip_force_mag.mean().item()
+
+        print(
+            '[ShadowHandHora][debug] '
+            f'step={self._debug_step_counter} '
+            f'actions_shape={act_shape} '
+            f'obs_shape={obs_shape} '
+            f'priv_shape={priv_shape} '
+            f'proprio_hist_shape={proprio_hist_shape} '
+            f'obs_nonfinite={int(obs_nonfinite)} '
+            f'wrist_target_maxabs={wrist_target_maxabs:.3e} '
+            f'wrist_pos_maxabs={wrist_pos_maxabs:.3e} '
+            f'tip_contact_force_mean={tip_force_mean:.3e}'
+        )
+
+    def reset(self):
+        obs_dict = super().reset()
+        obs_dict['priv_info'] = self.priv_info_buf.to(self.rl_device)
+        obs_dict['proprio_hist'] = self.proprio_hist_buf.to(self.rl_device)
+        return obs_dict
+
+    def step(self, actions):
+        obs_dict, rew_buf, reset_buf, extras = super().step(actions)
+        obs_dict['priv_info'] = self.priv_info_buf.to(self.rl_device)
+        obs_dict['proprio_hist'] = self.proprio_hist_buf.to(self.rl_device)
+        return obs_dict, rew_buf, reset_buf, extras
+
+    def update_low_level_control(self):
+        if self.torque_control:
+            torques = self.p_gain * (self.cur_targets - self.hand_dof_pos) - self.d_gain * self.hand_dof_vel
+
+            # lock wrist around 0 even in torque mode
+            torques[:, self.wrist_dof_indices] = (
+                self.wrist_p_gain * (0.0 - self.hand_dof_pos[:, self.wrist_dof_indices])
+                - self.wrist_d_gain * self.hand_dof_vel[:, self.wrist_dof_indices]
+            )
+
+            torques[:, self.controlled_dof_indices] = torch.clamp(
+                torques[:, self.controlled_dof_indices],
+                -self.finger_torque_limit,
+                self.finger_torque_limit,
+            )
+            torques[:, self.wrist_dof_indices] = torch.clamp(
+                torques[:, self.wrist_dof_indices],
+                -self.wrist_torque_limit,
+                self.wrist_torque_limit,
+            )
+            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torques))
+        else:
+            self.cur_targets[:, self.j0_indices] = self.cur_targets[:, self.j1_indices]
+            self.cur_targets[:, self.wrist_dof_indices] = 0.0
+            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.cur_targets))
+
+    def _compute_observations(self):
+        q = self.hand_dof_pos[:, self.controlled_dof_indices]
+        qn = unscale(
+            q,
+            self.hand_dof_lower_limits[self.controlled_dof_indices],
+            self.hand_dof_upper_limits[self.controlled_dof_indices],
+        )
+        t = self.cur_targets[:, self.controlled_dof_indices]
+        frame = torch.cat([qn, t], dim=-1)
+        self.obs_hist = torch.cat([self.obs_hist[:, 1:], frame.unsqueeze(1)], dim=1)
+        self.obs_buf[:, :132] = self.obs_hist.reshape(self.num_envs, -1)
+
+        # proprio_hist: last `propHistoryLen` frames of [qn(22), qdot(22)]
+        qd = self.hand_dof_vel[:, self.controlled_dof_indices]
+        frame_prop = torch.cat([qn, qd], dim=-1)  # [N, 44]
+
+        # Keep robust even if buffer width changes.
+        if frame_prop.shape[1] != self.proprio_hist_buf.shape[-1]:
+            target_w = self.proprio_hist_buf.shape[-1]
+            if frame_prop.shape[1] > target_w:
+                frame_prop = frame_prop[:, :target_w]
+            else:
+                pad = torch.zeros(self.num_envs, target_w - frame_prop.shape[1], device=self.device)
+                frame_prop = torch.cat([frame_prop, pad], dim=-1)
+
+        self.proprio_hist_buf = torch.cat(
+            [self.proprio_hist_buf[:, 1:], frame_prop.unsqueeze(1)], dim=1
+        )
+
+    def _refresh_gym(self):
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+
+        self.object_pose = self.root_state_tensor[self.object_indices, 0:7]
+        self.object_pos = self.root_state_tensor[self.object_indices, 0:3]
+        self.object_rot = self.root_state_tensor[self.object_indices, 3:7]
+
+    def _debug_print_root_state_once(self):
+        if self._printed_root_state_once:
+            return
+        self._printed_root_state_once = True
+
+        hand0 = int(self.hand_indices[0].item())
+        obj0 = int(self.object_indices[0].item())
+        print('[ShadowHandHora] headless:', self.headless, 'graphics_device_id:', self.graphics_device_id)
+        print('[ShadowHandHora] hand root xyz:', self.root_state_tensor[hand0, 0:3].detach().cpu().numpy())
+        print('[ShadowHandHora] obj  root xyz:', self.root_state_tensor[obj0, 0:3].detach().cpu().numpy())
+        if hasattr(self, 'palm_body_index'):
+            palm0 = self.rigid_body_states[0, self.palm_body_index, 0:3].detach().cpu().numpy()
+            objp0 = self.object_pos[0].detach().cpu().numpy()
+            print('[ShadowHandHora] palm xyz:', palm0)
+            print('[ShadowHandHora] obj-palm:', (objp0 - palm0))
+
+    def _align_hand_root_to_object(self, env_ids=None):
+        # Align actor root so that the palm is above the object by `hand_approach_height`.
+        # This uses actual rigid-body palm position, so it stays correct even if the URDF root is the forearm.
+        if not hasattr(self, 'palm_body_index'):
+            return
+
+        if env_ids is None:
+            palm_pos = self.rigid_body_states[:, self.palm_body_index, 0:3]
+            obj_pos = self.object_pos
+            hand_actor_ids = self.hand_indices
+        else:
+            palm_pos = self.rigid_body_states[env_ids, self.palm_body_index, 0:3]
+            obj_pos = self.object_pos[env_ids]
+            hand_actor_ids = self.hand_indices[env_ids]
+
+        desired_palm = obj_pos.clone()
+        desired_palm[:, 2] = desired_palm[:, 2] + self.hand_approach_height
+        delta = desired_palm - palm_pos
+
+        self.root_state_tensor[hand_actor_ids, 0:3] = self.root_state_tensor[hand_actor_ids, 0:3] + delta
+        self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
+
+    def _update_priv_info(self):
+        # [obj_pos(3), obj_scale(1), obj_mass(1), obj_com(3), obj_friction(1)] = 9
+        self.priv_info_buf[:, :] = 0.0
+        self.priv_info_buf[:, 0:3] = self.object_pos
+        self.priv_info_buf[:, 3] = float(self.base_obj_scale)
+        self.priv_info_buf[:, 4] = 0.058
+        self.priv_info_buf[:, 5:8] = 0.0
+        self.priv_info_buf[:, 8] = 1.0
+
+    def _create_ground_plane(self):
+        plane_params = gymapi.PlaneParams()
+        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
+        self.gym.add_ground(self.sim, plane_params)
+
+    def _create_object_asset(self):
+        asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../')
+        hand_asset_file = self.config['env']['asset']['handAsset']
+
+        hand_asset_options = gymapi.AssetOptions()
+        hand_asset_options.flip_visual_attachments = False
+        hand_asset_options.fix_base_link = False
+        hand_asset_options.collapse_fixed_joints = True
+        hand_asset_options.disable_gravity = True
+        hand_asset_options.thickness = 0.001
+        hand_asset_options.angular_damping = 100
+        hand_asset_options.linear_damping = 100
+        hand_asset_options.default_dof_drive_mode = int(gymapi.DOF_MODE_POS)
+        self.hand_asset = self.gym.load_asset(self.sim, asset_root, hand_asset_file, hand_asset_options)
+
+        tendon_count = self.gym.get_asset_tendon_count(self.hand_asset)
+        if tendon_count > 0:
+            tendon_props = self.gym.get_asset_tendon_properties(self.hand_asset)
+            for i in range(tendon_count):
+                tendon_props[i].limit_stiffness = 30.0
+                tendon_props[i].damping = 0.1
+            self.gym.set_asset_tendon_properties(self.hand_asset, tendon_props)
+
+        self.object_asset_list = []
+        for object_type in self.object_type_list:
+            object_asset_file = self.asset_files_dict[object_type]
+            object_asset = self.gym.load_asset(self.sim, asset_root, object_asset_file, gymapi.AssetOptions())
+            self.object_asset_list.append(object_asset)
+
+    def _init_object_pose(self):
+        hand_pose = gymapi.Transform()
+        hand_pose.p = gymapi.Vec3(float(self.hand_init_pos[0]), float(self.hand_init_pos[1]), float(self.hand_init_pos[2]))
+        if self.hand_init_rot is not None and len(self.hand_init_rot) == 4:
+            hand_pose.r = gymapi.Quat(
+                float(self.hand_init_rot[0]),
+                float(self.hand_init_rot[1]),
+                float(self.hand_init_rot[2]),
+                float(self.hand_init_rot[3]),
+            )
+        else:
+            # default: try to orient the palm towards -Z (down)
+            qx = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi)
+            qz = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), np.deg2rad(self.hand_extra_yaw_deg))
+            hand_pose.r = (qz * qx).normalize()
+
+        object_pose = gymapi.Transform()
+        o_cfg = (self.config.get('env', {}) or {}).get('object', {}) or {}
+        init_pos = o_cfg.get('initPos', [0.0, 0.0, 0.03])
+        object_pose.p = gymapi.Vec3(float(init_pos[0]), float(init_pos[1]), float(init_pos[2]))
+        return hand_pose, object_pose
+
+    def _setup_domain_rand_config(self, rand_config):
+        self.rand_config = rand_config or {}
+
+    def _setup_priv_option_config(self, p_config):
+        self.enable_priv_obj_position = p_config['enableObjPos']
+        self.enable_priv_obj_scale = p_config['enableObjScale']
+        self.enable_priv_obj_mass = p_config['enableObjMass']
+        self.enable_priv_obj_com = p_config['enableObjCOM']
+        self.enable_priv_obj_friction = p_config['enableObjFriction']
+
+    def _setup_reward_config(self, r_config):
+        r_config = r_config or {}
+        # All values below come from DAPG (Rajeswaran 2018) Relocate task,
+        # DexPoint (Qin 2022) default hyperparameters, and HORA (Qi 2022).
+        self.reach_alpha = float(r_config.get('reachAlpha', 10.0))
+        self.lift_bonus_low = float(r_config.get('liftBonusLow', 2.0))
+        self.lift_bonus_mid = float(r_config.get('liftBonusMid', 10.0))
+        self.lift_bonus_high = float(r_config.get('liftBonusHigh', 20.0))
+        self.lift_height_low = float(r_config.get('liftHeightLow', 0.04))
+        self.lift_height_mid = float(r_config.get('liftHeightMid', 0.08))
+        self.lift_height_high = float(r_config.get('liftHeightHigh', 0.15))
+        self.action_penalty_scale = float(r_config.get('actionPenaltyScale', 0.01))
+        self.object_rest_height = float(r_config.get('objectRestHeight', 0.046))
+
+    def _setup_object_info(self, o_config):
+        self.object_type = o_config['type']
+        self.object_type_list = [self.object_type]
+        self.asset_files_dict = {
+            'simple_tennis_ball': 'assets/ball.urdf',
+        }

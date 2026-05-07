@@ -1,0 +1,61 @@
+﻿import os
+import os
+
+import numpy as np
+import torch
+
+
+class DFCDataPool:
+    """UniDexGrasp datasetv4.1_posedata.npy loader.
+
+    数据结构: d[obj_code][scale] = {
+        target_qpos:     (N, 22) finger DOF
+        target_hand_pos: (N, 3)  hand world pos
+        target_hand_rot: (N, 4)  hand quat (x,y,z,w)
+        object_euler_xy: (N, 2)  object init euler
+        object_init_z:   (N, 1)  object init z
+    }
+    """
+
+    def __init__(self, source_path, target_scale=0.08):
+        assert os.path.isfile(source_path), source_path
+        self.target_scale = target_scale
+        raw = np.load(source_path, allow_pickle=True).item()
+
+        self.pool = {}
+        for obj_code, scale_dict in raw.items():
+            scale = self._pick_scale(list(scale_dict.keys()), target_scale)
+            e = scale_dict[scale]
+            obj_z = e['object_init_z'].squeeze(-1) if np.asarray(e['object_init_z']).ndim == 2 else e['object_init_z']
+            self.pool[obj_code] = dict(
+                q=np.asarray(e['target_qpos'], dtype=np.float32),
+                pos=np.asarray(e['target_hand_pos'], dtype=np.float32),
+                rot=np.asarray(e['target_hand_rot'], dtype=np.float32),
+                obj_eul=np.asarray(e['object_euler_xy'], dtype=np.float32),
+                obj_z=np.asarray(obj_z, dtype=np.float32),
+                scale=float(scale),
+                n=int(np.asarray(e['target_qpos']).shape[0]),
+            )
+        print(f'[DFCDataPool] {len(self.pool)} objects, scale={target_scale}')
+
+    @staticmethod
+    def _pick_scale(keys, t):
+        return t if t in keys else min(keys, key=lambda x: abs(x - t))
+
+    def keys(self):
+        return list(self.pool.keys())
+
+    def find_objects(self, keywords):
+        return [k for k in self.pool.keys() if any(kw in k for kw in keywords)]
+
+    def sample(self, obj_code, n, device='cuda:0'):
+        e = self.pool[obj_code]
+        idx = np.random.randint(0, e['n'], size=n)
+        return dict(
+            q=torch.from_numpy(e['q'][idx]).to(device),
+            pos=torch.from_numpy(e['pos'][idx]).to(device),
+            rot=torch.from_numpy(e['rot'][idx]).to(device),
+            obj_eul=torch.from_numpy(e['obj_eul'][idx]).to(device),
+            obj_z=torch.from_numpy(e['obj_z'][idx]).to(device),
+            scale=e['scale'],
+        )
