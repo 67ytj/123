@@ -2,13 +2,13 @@
   "ExpandedNodes": [
     "",
     "\\tiaoshi 为了让奖励不为0",
-    "\\tiaoshi 为了让奖励不为0\\assets\\shadow_hand_description",
+    "\\tiaoshi 为了让奖励不为0\\configs",
     "\\tiaoshi 为了让奖励不为0\\configs\\task",
     "\\tiaoshi 为了让奖励不为0\\hora",
     "\\tiaoshi 为了让奖励不为0\\hora\\tasks",
     "\\tiaoshi 为了让奖励不为0\\hora\\utils",
     "\\tmp"
   ],
-  "SelectedNode": "\\tiaoshi 为了让奖励不为0\\hora\\tasks\\shadow_hand_hora.py",
+  "SelectedNode": "\\tiaoshi 为了让奖励不为0\\configs\\task\\ShadowHandHora.yaml",
   "PreviewInSolutionExplorer": false
 }

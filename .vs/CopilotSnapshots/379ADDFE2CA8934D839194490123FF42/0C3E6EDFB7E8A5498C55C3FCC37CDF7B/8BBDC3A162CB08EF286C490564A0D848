@@ -1,4 +1,4 @@
-import os
+﻿import os
 import os
 import torch
 import numpy as np
@@ -382,9 +382,6 @@ class ShadowHandHora(VecTask):
         print('[ShadowHandHora] MJCF indices ok: 18 actuator + 22 finger DOF + 4 mirrored J0 + wrist via root')
         print('[ShadowHandHora] Fingertip bodies:', list(zip(FINGERTIP_BODIES, self.fingertip_body_indices.detach().cpu().tolist())))
 
-        # Verify collapse_fixed_joints=False worked
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-
     def _acquire_tensors(self):
         actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
@@ -428,7 +425,6 @@ class ShadowHandHora(VecTask):
             self.root_state_tensor[hand_actor_ids, 0:3] = g['pos']
             self.root_state_tensor[hand_actor_ids, 3:7] = g['rot']
             self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
-            self._locked_root_rot[env_ids_long] = g['rot']
 
             dof_view = self.dof_state.view(self.num_envs, -1, 2)
             dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 0] = g['q']
@@ -578,12 +574,6 @@ class ShadowHandHora(VecTask):
 
         # ---- Fingers: integrate to joint targets ----
         finger_action = torch.clamp(finger_action, -1.0, 1.0)
-
-        # DFC warm-up: 前 50 步缩小 finger 动作幅度
-        if self.dfc_pool is not None:
-            warmup = (self.progress_buf.float() / 50.0).clamp(0.0, 1.0).unsqueeze(-1)
-            finger_action = finger_action * warmup
-
         targets = self.prev_targets.clone()
 
         targets[:, self.actuator_dof_indices_18] = targets[:, self.actuator_dof_indices_18] + (1.0 / 48.0) * finger_action
@@ -607,7 +597,7 @@ class ShadowHandHora(VecTask):
         with torch.no_grad():
             # === Sim-derived quantities (all from IsaacGym tensors) ===
             finger_pos = self.rigid_body_states[:, self.fingertip_body_indices, 0:3]
-            palm_pos   = self.rigid_body_states[:, self.fingertip_body_indices, 0:3].mean(dim=1)
+            palm_pos   = self.rigid_body_states[:, self.palm_body_index, 0:3]
             obj_pos    = self.object_pos
             tip_forces = self.contact_forces[:, self.fingertip_body_indices, :]
 
@@ -825,24 +815,20 @@ class ShadowHandHora(VecTask):
         self.object_rot = self.root_state_tensor[self.object_indices, 3:7]
 
     def _debug_print_root_state_once(self):
-            if getattr(self, '_dbg_printed', False):
-                return
-            self._dbg_printed = True
-    
-            rb = self.rigid_body_states[0, :, 0:3].detach().cpu().numpy()  # (n_bodies, 3)
-            print(f'[DEBUG] num_bodies = {rb.shape[0]}')
-    
-            # 把 body name 列表也打出来(如果有)
-            if hasattr(self, 'body_names'):
-                for i, name in enumerate(self.body_names):
-                    print(f'[DEBUG] body[{i:2d}] {name:30s} xyz = {rb[i]}')
-            else:
-                for i in range(rb.shape[0]):
-                    print(f'[DEBUG] body[{i:2d}] xyz = {rb[i]}')
-    
-            print(f'[DEBUG] palm_body_index = {self.palm_body_index}')
-            print(f'[DEBUG] fingertip_body_indices = {self.fingertip_body_indices}')
-            print(f'[DEBUG] obj_pos = {self.object_pos[0].detach().cpu().numpy()}')
+        if self._printed_root_state_once:
+            return
+        self._printed_root_state_once = True
+
+        hand0 = int(self.hand_indices[0].item())
+        obj0 = int(self.object_indices[0].item())
+        print('[ShadowHandHora] headless:', self.headless, 'graphics_device_id:', self.graphics_device_id)
+        print('[ShadowHandHora] hand root xyz:', self.root_state_tensor[hand0, 0:3].detach().cpu().numpy())
+        print('[ShadowHandHora] obj  root xyz:', self.root_state_tensor[obj0, 0:3].detach().cpu().numpy())
+        if hasattr(self, 'palm_body_index'):
+            palm0 = self.rigid_body_states[0, self.palm_body_index, 0:3].detach().cpu().numpy()
+            objp0 = self.object_pos[0].detach().cpu().numpy()
+            print('[ShadowHandHora] palm xyz:', palm0)
+            print('[ShadowHandHora] obj-palm:', (objp0 - palm0))
 
     def _align_hand_root_to_object(self, env_ids=None):
         # Align actor root so that the palm is above the object by `hand_approach_height`.

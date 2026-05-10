@@ -1,4 +1,4 @@
-name: ShadowHandHora
+﻿name: ShadowHandHora
 physics_engine: ${..physics_engine}
 on_evaluation: False
 
@@ -31,9 +31,9 @@ env:
     # 手臂 xyz 动作缩放
     arm_xyz_action_scale: 0.005
     arm_xyz_workspace:
-      x: [-0.20, 0.20]
-      y: [-0.20, 0.20]
-      z: [0.02, 0.30]
+      x: [-0.05, 0.05]
+      y: [-0.05, 0.05]
+      z: [0.02, 0.15]
 
   genGrasps: False
   clipObservations: 5.0
@@ -112,7 +112,7 @@ env:
     fixBaseLink: False
     kinematicBase: False
     policyControlsArm: True
-    alignToObject: False
+    alignToObject: True
     initRot: [0.5, 0.5, 0.5, 0.5]
     initPos: [0.0, 0.0, 0.08]
     approachHeight: 0.07
@@ -127,7 +127,7 @@ env:
     enable: true
     sourcePath: 'assets/datasetv4.1_posedata.npy'
     targetScale: 0.08
-    objectKeywords: ['Ball-']
+    objectKeywords: ['Apple', 'Orange', 'Bottle', 'Egg', 'Sphere', 'Ball']
 
   enableCameraSensors: False
 
@@ -152,4 +152,4 @@ sim:
     num_subscenes: ${....num_subscenes}
     contact_offset: 0.002
     rest_offset: 0.0
-    contact_collection: 2    contact_collection: 2
+    contact_collection: 2

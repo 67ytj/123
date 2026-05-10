@@ -1,4 +1,4 @@
-name: ShadowHandHora
+﻿name: ShadowHandHora
 physics_engine: ${..physics_engine}
 on_evaluation: False
 
@@ -127,7 +127,7 @@ env:
     enable: true
     sourcePath: 'assets/datasetv4.1_posedata.npy'
     targetScale: 0.08
-    objectKeywords: ['Ball-']
+    objectKeywords: ['Apple', 'Orange', 'Bottle', 'Egg', 'Sphere', 'Ball']
 
   enableCameraSensors: False
 
@@ -152,4 +152,4 @@ sim:
     num_subscenes: ${....num_subscenes}
     contact_offset: 0.002
     rest_offset: 0.0
-    contact_collection: 2    contact_collection: 2
+    contact_collection: 2
