@@ -33,7 +33,7 @@ env:
     arm_xyz_workspace:
       x: [-0.20, 0.20]
       y: [-0.20, 0.20]
-      z: [0.02, 0.30]
+      z: [0.05, 0.60]
 
   genGrasps: False
   clipObservations: 5.0
@@ -72,7 +72,7 @@ env:
       success:  10.0
     objectRestHeight:    0.046
 
-  baseObjScale: 0.8
+  baseObjScale: 1.0
 
   # ⚠ 改动:先全部关掉,等 baseline 能抓起再逐项打开(HORA 的 priv_info 需要真值 DR)
   randomization:
@@ -112,7 +112,7 @@ env:
     fixBaseLink: False
     kinematicBase: False
     policyControlsArm: True
-    alignToObject: False
+    alignToObject: false
     initRot: [0.5, 0.5, 0.5, 0.5]
     initPos: [0.0, 0.0, 0.08]
     approachHeight: 0.07
@@ -126,7 +126,7 @@ env:
   dfcdata:
     enable: true
     sourcePath: 'assets/datasetv4.1_posedata.npy'
-    targetScale: 0.08
+    targetScale: 0.06
     objectKeywords: ['Ball-']
 
   enableCameraSensors: False
@@ -152,4 +152,4 @@ sim:
     num_subscenes: ${....num_subscenes}
     contact_offset: 0.002
     rest_offset: 0.0
-    contact_collection: 2    contact_collection: 2
+    contact_collection: 2

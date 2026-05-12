@@ -49,6 +49,12 @@ class DFCDataPool:
                 skip_bad += 1
         print(f'[DFCDataPool] {len(self.pool)} objects loaded '
               f'(skipped {skip_empty} empty, {skip_bad} bad), scale={target_scale}')
+
+        # Debug: list all available scales for Ball objects
+        for obj_code, scale_dict in raw.items():
+            if 'Ball-' in obj_code:
+                print(f'[DFC-SCALES-AVAIL] {obj_code}: {sorted(scale_dict.keys())}')
+
         assert len(self.pool) > 0, 'no valid DFCData objects loaded'
 
     @staticmethod
@@ -64,7 +70,7 @@ class DFCDataPool:
     def sample(self, obj_code, n, device='cuda:0'):
         e = self.pool[obj_code]
         idx = np.random.randint(0, e['n'], size=n)
-        return dict(
+        result = dict(
             q=torch.from_numpy(e['q'][idx]).to(device),
             pos=torch.from_numpy(e['pos'][idx]).to(device),
             rot=torch.from_numpy(e['rot'][idx]).to(device),
@@ -72,3 +78,16 @@ class DFCDataPool:
             obj_z=torch.from_numpy(e['obj_z'][idx]).to(device),
             scale=e['scale'],
         )
+
+        # Debug: print scale info once
+        if not getattr(self, '_dbg_scale_printed', False):
+            self._dbg_scale_printed = True
+            print(f'[DFC-SCALE] obj_code     = {obj_code}')
+            print(f'[DFC-SCALE] picked scale = {e["scale"]}')
+            print(f'[DFC-SCALE] N poses      = {e["n"]}')
+            print(f'[DFC-SCALE] q[0]         = {e["q"][0]}')
+            print(f'[DFC-SCALE] pos[0]       = {e["pos"][0]}')
+            print(f'[DFC-SCALE] obj_z[0]     = {e["obj_z"][0]}')
+            print(f'[DFC-SCALE] obj_eul[0]   = {e["obj_eul"][0]}')
+
+        return result

@@ -407,15 +407,25 @@ class ShadowHandHora(VecTask):
 
         env_ids_long = env_ids.long() if env_ids.dtype != torch.long else env_ids
 
-        # Always reset the object root first.
+        # ===== Always reset the object root first =====
         object_actor_ids = self.object_indices[env_ids_long]
         self.root_state_tensor[object_actor_ids] = self.object_init_state[env_ids_long].clone()
         self.root_state_tensor[object_actor_ids, 7:13] = 0.0
         self.object_init_z[env_ids_long] = self.root_state_tensor[object_actor_ids, 2]
 
         if self.dfc_pool is not None:
+            # ============================================================
+            # DFC branch: use g['q'] grasp pose. NO noise overwrite later.
+            # ============================================================
             g = self.dfc_pool.sample(self.current_object_code, len(env_ids_long), device=self.device)
 
+            # LIFT entire grasp scenario by 0.20 m so hand never enters ground
+            LIFT = 0.20
+            g['pos'] = g['pos'].clone()
+            g['pos'][:, 2] = g['pos'][:, 2] + LIFT
+            g['obj_z'] = g['obj_z'].clone() + LIFT
+
+            # --- object pose ---
             obj_pos = self.root_state_tensor[object_actor_ids, 0:3].clone()
             obj_pos[:, 2] = g['obj_z']
             obj_quat = euler_xy_to_quat(g['obj_eul'])
@@ -424,27 +434,85 @@ class ShadowHandHora(VecTask):
             self.root_state_tensor[object_actor_ids, 7:13] = 0.0
             self.object_init_z[env_ids_long] = obj_pos[:, 2]
 
+            # --- hand root pose ---
             hand_actor_ids = self.hand_indices[env_ids_long]
             self.root_state_tensor[hand_actor_ids, 0:3] = g['pos']
             self.root_state_tensor[hand_actor_ids, 3:7] = g['rot']
             self.root_state_tensor[hand_actor_ids, 7:13] = 0.0
             self._locked_root_rot[env_ids_long] = g['rot']
 
+            # --- finger DOF state = g['q'] ---
             dof_view = self.dof_state.view(self.num_envs, -1, 2)
             dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 0] = g['q']
             dof_view[env_ids_long[:, None], self.finger_dof_indices_22[None, :], 1] = 0.0
 
+            # --- targets = g['q'] (clear all first, then write 22 finger dims) ---
             self.cur_targets[env_ids_long] = 0.0
             self.prev_targets[env_ids_long] = 0.0
             self.cur_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
             self.prev_targets[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
 
+            # --- hand_dof_pos view = g['q'] (mirror of dof_view above for consistency) ---
             self.hand_dof_vel[env_ids_long, :] = 0.0
             self.hand_dof_pos[env_ids_long, :] = 0.0
             self.hand_dof_pos[env_ids_long[:, None], self.finger_dof_indices_22[None, :]] = g['q']
 
+            # --- J0 mirror from J1 (coupled tendons) ---
+            self.cur_targets[env_ids_long[:, None], self.j0_indices[None, :]] = \
+                self.cur_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+            self.prev_targets[env_ids_long[:, None], self.j0_indices[None, :]] = \
+                self.prev_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+
             self.q_star_22[env_ids_long] = g['q']
+
+            # --- one-shot debug print ---
+            if not getattr(self, '_dbg_dfc_reset_printed', False):
+                self._dbg_dfc_reset_printed = True
+                print('[RESET-DFC] hand_root_pos =', self.root_state_tensor[hand_actor_ids[0], 0:3].cpu().numpy())
+                print('[RESET-DFC] obj_pos       =', self.root_state_tensor[object_actor_ids[0], 0:3].cpu().numpy())
+                print('[RESET-DFC] g[pos][0]     =', g['pos'][0].cpu().numpy())
+                print('[RESET-DFC] g[obj_z][0]   =', g['obj_z'][0].cpu().numpy())
+                print('[RESET-DFC] g[q][0]       =', g['q'][0].cpu().numpy())
+                # Verify write succeeded:
+                actual = self.hand_dof_pos[env_ids_long[0], self.finger_dof_indices_22].cpu().numpy()
+                expect = g['q'][0].cpu().numpy()
+                import numpy as _np
+                mae = float(_np.abs(actual - expect).mean())
+                print(f'[RESET-DFC-VERIFY] |hand_dof_pos - g[q]|.mean() = {mae:.5f}  (must be ~0)')
+                print(f'[RESET-DFC-VERIFY] actual[:8] = {actual[:8]}')
+                print(f'[RESET-DFC-VERIFY] expect[:8] = {expect[:8]}')
+
+                # ===== 一次性几何诊断 =====
+                if not getattr(self, '_dbg_geom_printed', False):
+                    self._dbg_geom_printed = True
+                    self.gym.refresh_rigid_body_state_tensor(self.sim)
+                    self.gym.refresh_net_contact_force_tensor(self.sim)
+
+                    i = env_ids_long[0].item()
+                    hand_root = self.root_state_tensor[self.hand_indices[i], 0:3].cpu().numpy()
+                    ball_pos  = self.root_state_tensor[self.object_indices[i], 0:3].cpu().numpy()
+                    palm_pos  = self.rigid_body_states[i, self.palm_body_index, 0:3].cpu().numpy()
+                    tip_pos   = self.rigid_body_states[i, self.fingertip_body_indices, 0:3].cpu().numpy()
+                    tip_F     = self.contact_forces[i, self.fingertip_body_indices, :].cpu().numpy()
+
+                    print('='*60)
+                    print(f'[GEOM] base_obj_scale = {self.base_obj_scale}')
+                    print(f'[GEOM] hand_root_xyz = {hand_root}')
+                    print(f'[GEOM] palm_xyz      = {palm_pos}')
+                    print(f'[GEOM] ball_xyz      = {ball_pos}')
+                    print(f'[GEOM] palm-ball_xyz = {palm_pos - ball_pos}')
+                    print(f'[GEOM] palm-ball_dist= {((palm_pos-ball_pos)**2).sum()**0.5:.4f}m')
+                    for k, name in enumerate(['FF', 'MF', 'RF', 'LF', 'TH']):
+                        dxyz = tip_pos[k] - ball_pos
+                        d = float((dxyz**2).sum()**0.5)
+                        F = float((tip_F[k]**2).sum()**0.5)
+                        print(f'[GEOM] {name}: tip-ball={dxyz}  dist={d:.4f}m  F={F:.3f}N')
+                    print('='*60)
+
         else:
+            # ============================================================
+            # Non-DFC branch: random open-hand init
+            # ============================================================
             if not self.hand_fix_base_link and self.hand_init_state is not None:
                 hand_actor_ids = self.hand_indices[env_ids_long]
                 self.root_state_tensor[hand_actor_ids] = self.hand_init_state[env_ids_long].clone()
@@ -463,36 +531,46 @@ class ShadowHandHora(VecTask):
             if self.hand_align_to_object:
                 self._align_hand_root_to_object(env_ids=env_ids_long)
 
-                hand_actor_ids = self.hand_indices[env_ids_long]
-                self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
+            hand_actor_ids = self.hand_indices[env_ids_long]
+            self.root_state_tensor[hand_actor_ids, 3:7] = self._locked_root_rot[env_ids_long]
 
-                hand_actor_ids_i32 = hand_actor_ids.to(torch.int32)
-                self.gym.set_actor_root_state_tensor_indexed(
-                    self.sim,
-                    gymtorch.unwrap_tensor(self.root_state_tensor),
-                    gymtorch.unwrap_tensor(hand_actor_ids_i32),
-                    len(env_ids_long),
-                )
+            hand_actor_ids_i32 = hand_actor_ids.to(torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_state_tensor),
+                gymtorch.unwrap_tensor(hand_actor_ids_i32),
+                len(env_ids_long),
+            )
 
             self.hand_dof_pos[env_ids_long, :] = 0.0
             self.hand_dof_vel[env_ids_long, :] = 0.0
 
-            noise = torch_rand_float(-0.05, 0.05, (len(env_ids_long), self.actuator_dof_indices_18.numel()), device=self.device) + 0.35
+            noise = torch_rand_float(
+                -0.05, 0.05,
+                (len(env_ids_long), self.actuator_dof_indices_18.numel()),
+                device=self.device,
+            ) + 0.35
             noise = tensor_clamp(
                 noise,
                 self.hand_dof_lower_limits[self.actuator_dof_indices_18],
                 self.hand_dof_upper_limits[self.actuator_dof_indices_18],
             )
             self.hand_dof_pos[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
+
             self.cur_targets[env_ids_long] = 0.0
             self.prev_targets[env_ids_long] = 0.0
             self.cur_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
             self.prev_targets[env_ids_long[:, None], self.actuator_dof_indices_18[None, :]] = noise
 
-        if self.dfc_pool is None:
-            self.cur_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.cur_targets[env_ids_long[:, None], self.j1_indices[None, :]]
-            self.prev_targets[env_ids_long[:, None], self.j0_indices[None, :]] = self.prev_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+            # J0 mirror from J1
+            self.cur_targets[env_ids_long[:, None], self.j0_indices[None, :]] = \
+                self.cur_targets[env_ids_long[:, None], self.j1_indices[None, :]]
+            self.prev_targets[env_ids_long[:, None], self.j0_indices[None, :]] = \
+                self.prev_targets[env_ids_long[:, None], self.j1_indices[None, :]]
 
+        # ============================================================
+        # Common: push state to sim (both modes)
+        # ============================================================
         combined_actor_ids = torch.cat([
             self.hand_indices[env_ids_long],
             torch.unique(self.object_indices[env_ids_long]),
@@ -578,11 +656,6 @@ class ShadowHandHora(VecTask):
 
         # ---- Fingers: integrate to joint targets ----
         finger_action = torch.clamp(finger_action, -1.0, 1.0)
-
-        # DFC warm-up: 前 50 步缩小 finger 动作幅度
-        if self.dfc_pool is not None:
-            warmup = (self.progress_buf.float() / 50.0).clamp(0.0, 1.0).unsqueeze(-1)
-            finger_action = finger_action * warmup
 
         targets = self.prev_targets.clone()
 
